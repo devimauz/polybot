@@ -1,0 +1,9 @@
+.venv/
+.env
+__pycache__/
+gui-preview.png
+*.sqlite3*
+price_logs/
+*.log
+*.log.*
+*.out
