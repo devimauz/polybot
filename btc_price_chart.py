@@ -13,7 +13,6 @@ from tkinter import ttk
 
 import httpx
 import websocket
-import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
 from bot import ROOT
@@ -23,6 +22,7 @@ from polymarket_feed import MarketFeed
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 RTDS_API = "wss://ws-live-data.polymarket.com"
 COINBASE_API = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 KRAKEN_API = "https://api.kraken.com/0/public/Ticker"
 BITSTAMP_API = "https://www.bitstamp.net/api/v2/ticker/btcusd/"
@@ -31,6 +31,11 @@ BYBIT_API = "https://api.bybit.com/v5/market/tickers"
 GEMINI_API = "https://api.gemini.com/v1/pubticker/btcusd"
 WINDOW_SECONDS = 300.0
 TRADE_START_DELAY_SECONDS = 0.0
+TRADE_COOLDOWN_SECONDS = 1.0
+JUMP_TP_RATE = Decimal("0.10")
+JUMP_STAKE = Decimal("100")
+MIN_ENTRY_PRICE = Decimal("0.15")
+MAX_ENTRY_PRICE = Decimal("0.85")
 TREND_SECONDS = 10.0
 TREND_MIN_MOVE = 1.0
 FRAME_MS = 20
@@ -40,7 +45,6 @@ UP_COLOR, DOWN_COLOR, BTC_COLOR = "#39d98a", "#ff6577", "#f5b942"
 COINBASE_COLOR, BINANCE_COLOR = "#4d8dff", "#f08a24"
 KRAKEN_COLOR, BITSTAMP_COLOR = "#a970ff", "#45d6d0"
 OKX_COLOR, BYBIT_COLOR, GEMINI_COLOR = "#eeeeee", "#f4d03f", "#e056fd"
-MT5_COLOR = "#ff3b30"
 POSITION_COLOR = "#5bc0ff"
 
 
@@ -260,16 +264,16 @@ class ExchangePriceFeed:
                 self.stop.wait(0.5)
 
 
-class MetaTraderPriceFeed:
-    """Read a broker's BTC tick from the locally installed MT5 terminal."""
+class CoinbasePriceFeed:
+    """Stream Coinbase Exchange BTC-USD ticker prices over WebSocket."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.price = None
-        self.symbol = None
-        self.error = "Connecting to MetaTrader 5..."
+        self.error = "Connecting to Coinbase Exchange..."
         self.stop = threading.Event()
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread = threading.Thread(
+            target=self.run, name="coinbase-btc-feed", daemon=True)
 
     def start(self):
         self.thread.start()
@@ -279,47 +283,65 @@ class MetaTraderPriceFeed:
             return self.price, self.error
 
     def run(self):
-        try:
-            if not mt5.initialize():
-                raise RuntimeError("MT5 initialization failed")
-            symbols = [item.name for item in (mt5.symbols_get() or [])
-                       if "BTC" in item.name.upper()]
-            self.symbol = next((name for name in symbols
-                                if name.upper() == "BTCUSD"),
-                               symbols[0] if symbols else None)
-            if not self.symbol:
-                raise RuntimeError("No BTC symbol in MT5")
-            mt5.symbol_select(self.symbol, True)
-            while not self.stop.is_set():
-                tick = mt5.symbol_info_tick(self.symbol)
-                if tick and tick.bid > 0 and tick.ask > 0:
-                    price = float(tick.ask)
+        subscription = {
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channels": ["ticker"],
+        }
+        while not self.stop.is_set():
+            socket = None
+            try:
+                socket = websocket.create_connection(COINBASE_WS, timeout=8)
+                socket.send(json.dumps(subscription))
+                socket.settimeout(2)
+                while not self.stop.is_set():
+                    try:
+                        message = json.loads(socket.recv())
+                    except websocket.WebSocketTimeoutException:
+                        socket.ping()
+                        continue
+                    if (message.get("type") != "ticker" or
+                            message.get("product_id") != "BTC-USD"):
+                        continue
+                    price = float(message["price"])
+                    if price <= 0:
+                        continue
                     with self.lock:
                         self.price, self.error = price, ""
-                else:
-                    with self.lock:
-                        self.error = f"MetaTrader 5 waiting for {self.symbol}"
-                self.stop.wait(0.02)
-        except Exception as exc:
-            with self.lock:
-                self.error = f"MetaTrader 5 {type(exc).__name__}"
-        finally:
-            mt5.shutdown()
+            except Exception as exc:
+                with self.lock:
+                    self.error = f"Coinbase Exchange {type(exc).__name__}"
+                self.stop.wait(0.5)
+            finally:
+                if socket is not None:
+                    try:
+                        socket.close()
+                    except Exception:
+                        pass
 
 
 class JumpPaperTrader:
-    """One PolySimulator jump entry per BTC five-minute market with 10% TP."""
+    """PolySimulator jump entries spaced by one second, each with 10% TP."""
+
+    venue_name = "POLYSIM"
 
     def __init__(self):
         self.db_path = ROOT / "chart-jump-paper.sqlite3"
         self.http = httpx.Client(timeout=10)
         setup = OpeningBot(
-            asset="btc", amount=Decimal("10"), paper=True, entry_window=300,
-            db_path=self.db_path, http_client=self.http)
+            asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
+            db_path=self.db_path, http_client=self.http,
+            take_profit=JUMP_TP_RATE)
         setup.close()
         with sqlite3.connect(self.db_path) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS jump_signals (
                 market TEXT PRIMARY KEY, outcome TEXT, move REAL, created REAL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS jump_entries (
+                market TEXT, slot INTEGER, trade_key TEXT UNIQUE, outcome TEXT,
+                move REAL, created REAL, PRIMARY KEY(market,slot))""")
+            db.execute("""INSERT OR IGNORE INTO jump_entries
+                (market,slot,trade_key,outcome,move,created)
+                SELECT market,1,market,outcome,move,created FROM jump_signals""")
         self.lock = threading.Lock()
         self.inflight = set()
         self.preparing = set()
@@ -346,13 +368,13 @@ class JumpPaperTrader:
         with sqlite3.connect(self.db_path) as db:
             db.row_factory = sqlite3.Row
             row = db.execute("""SELECT outcome,price,shares,tick,tp_state
-                FROM trades WHERE market=? AND entry_state='filled'
-                ORDER BY rowid DESC LIMIT 1""", (slug,)).fetchone()
+                FROM trades WHERE market LIKE ? AND entry_state='filled'
+                ORDER BY rowid DESC LIMIT 1""", (slug + "#jump-%",)).fetchone()
         position = None
         if row and row["price"]:
             price = Decimal(row["price"])
             tick = Decimal(row["tick"])
-            target = (price * Decimal("1.10") / tick).to_integral_value(
+            target = (price * (Decimal("1") + JUMP_TP_RATE) / tick).to_integral_value(
                 rounding="ROUND_CEILING") * tick
             position = {
                 "outcome": row["outcome"],
@@ -376,8 +398,8 @@ class JumpPaperTrader:
             db.row_factory = sqlite3.Row
             row = db.execute("""SELECT j.market,j.outcome,j.move,t.entry_state,
                 t.price,t.shares,t.tick,t.tp_state,t.detail
-                FROM jump_signals AS j LEFT JOIN trades AS t
-                  ON t.market=j.market AND t.outcome=j.outcome
+                FROM jump_entries AS j LEFT JOIN trades AS t
+                  ON t.market=j.trade_key AND t.outcome=j.outcome
                 ORDER BY j.created DESC LIMIT 1""").fetchone()
         trade = None
         if row:
@@ -385,16 +407,17 @@ class JumpPaperTrader:
             if row["price"] and row["tick"]:
                 price, tick = Decimal(row["price"]), Decimal(row["tick"])
                 trade["target"] = float(
-                    (price * Decimal("1.10") / tick).to_integral_value(
+                    (price * (Decimal("1") + JUMP_TP_RATE) / tick).to_integral_value(
                         rounding="ROUND_CEILING") * tick)
         with self.lock:
             self.latest_cache = (now, trade)
         return trade
 
-    def seen_market(self, slug):
+    def trade_window_state(self, slug):
         with sqlite3.connect(self.db_path) as db:
-            return db.execute("SELECT 1 FROM jump_signals WHERE market=? LIMIT 1",
-                              (slug,)).fetchone() is not None
+            return db.execute("""SELECT COALESCE(MAX(slot),0),
+                COALESCE(MAX(created),0) FROM jump_entries WHERE market=?""",
+                              (slug,)).fetchone()
 
     def prepare(self, slug):
         """Warm the connection and cache simulator market metadata before signals."""
@@ -409,9 +432,9 @@ class JumpPaperTrader:
         bot = None
         try:
             bot = OpeningBot(
-                asset="btc", amount=Decimal("10"), paper=True,
+                asset="btc", amount=JUMP_STAKE, paper=True,
                 entry_window=300, db_path=self.db_path,
-                http_client=self.http)
+                http_client=self.http, take_profit=JUMP_TP_RATE)
             for _ in range(10):
                 if self.stop.is_set():
                     return
@@ -432,29 +455,38 @@ class JumpPaperTrader:
             with self.lock:
                 self.preparing.discard(expected_slug)
 
-    def submit(self, slug, outcome, move, tick="0.01"):
+    def submit(self, slug, outcome, move, tick="0.01", token=None):
         with self.lock:
-            if slug in self.inflight or self.seen_market(slug):
+            last_slot, last_created = self.trade_window_state(slug)
+            elapsed = time.time() - last_created
+            if last_created and elapsed < TRADE_COOLDOWN_SECONDS:
+                self.status = (f"trade cooldown "
+                               f"{TRADE_COOLDOWN_SECONDS - elapsed:.2f}s")
                 return False
+            slot = last_slot + 1
+            trade_key = f"{slug}#jump-{slot}"
             with sqlite3.connect(self.db_path) as db:
                 cursor = db.execute(
-                    "INSERT OR IGNORE INTO jump_signals VALUES (?,?,?,?)",
-                    (slug, outcome, move, time.time()))
+                    "INSERT OR IGNORE INTO jump_entries VALUES (?,?,?,?,?,?)",
+                    (slug, slot, trade_key, outcome, move, time.time()))
                 if not cursor.rowcount:
                     return False
-            self.inflight.add(slug)
-            self.status = f"signal {outcome} ({move:+.2f}); submitting"
+            self.inflight.add(trade_key)
+            self.status = (f"trade {slot} signal "
+                           f"{outcome} ({move:+.2f}); submitting")
             self.latest_cache = (0.0, None)
-        threading.Thread(target=self._execute, args=(slug, outcome, tick),
+        threading.Thread(target=self._execute,
+                         args=(slug, trade_key, outcome, tick),
                          name="chart-jump-order", daemon=True).start()
         return True
 
-    def _execute(self, expected_slug, outcome, tick):
+    def _execute(self, expected_slug, trade_key, outcome, tick):
         bot = None
         try:
             bot = OpeningBot(
-                asset="btc", amount=Decimal("10"), paper=True, entry_window=300,
-                db_path=self.db_path, http_client=self.http)
+                asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
+                db_path=self.db_path, http_client=self.http,
+                take_profit=JUMP_TP_RATE)
             with self.lock:
                 cached = self.prepared.get(expected_slug)
             if cached:
@@ -465,10 +497,11 @@ class JumpPaperTrader:
             if not market or market[0] != expected_slug:
                 raise ValueError("simulator market unavailable")
             slug, end, tokens = market
-            bot.enter(slug, end, outcome, tokens[outcome], direct_tick=tick)
+            bot.enter(trade_key, end, outcome, tokens[outcome], direct_tick=tick,
+                      direct_limit=MAX_ENTRY_PRICE)
             row = bot.db.execute(
                 "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
-                (slug, outcome)).fetchone()
+                (trade_key, outcome)).fetchone()
             with self.lock:
                 self.status = (f"{outcome} " +
                                (f"{row['entry_state']}; TP {row['tp_state']}"
@@ -478,7 +511,7 @@ class JumpPaperTrader:
             bot.place_profits()
             row = bot.db.execute(
                 "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
-                (slug, outcome)).fetchone()
+                (trade_key, outcome)).fetchone()
             if row:
                 with self.lock:
                     self.status = (f"{outcome} {row['entry_state']}; "
@@ -492,16 +525,16 @@ class JumpPaperTrader:
             if bot is not None:
                 bot.close()
             with self.lock:
-                self.inflight.discard(expected_slug)
+                self.inflight.discard(trade_key)
 
     def _maintain(self):
         while not self.stop.wait(5):
             bot = None
             try:
                 bot = OpeningBot(
-                    asset="btc", amount=Decimal("10"), paper=True,
+                    asset="btc", amount=JUMP_STAKE, paper=True,
                     entry_window=300, db_path=self.db_path,
-                    http_client=self.http)
+                    http_client=self.http, take_profit=JUMP_TP_RATE)
                 bot.place_profits()
             except Exception as exc:
                 with self.lock:
@@ -553,24 +586,24 @@ class Discovery:
 
 
 class PriceChart:
-    def __init__(self, root):
+    def __init__(self, root, trader_factory=JumpPaperTrader):
         self.root = root
         root.title("BTC Live - Polymarket Price + 5-Minute Up")
         root.geometry("1100x720")
         root.minsize(760, 520)
         root.configure(bg=BG)
         self.feed, self.btc_feed = MarketFeed(), PolymarketBTCFeed()
-        self.mt5_feed = MetaTraderPriceFeed()
-        self.jump_trader = JumpPaperTrader()
+        self.coinbase_feed = CoinbasePriceFeed()
+        self.jump_trader = trader_factory()
         self.jump_threshold = float(os.environ.get("JUMP_THRESHOLD_USD", "10"))
         if self.jump_threshold <= 0:
             raise ValueError("Invalid jump trader threshold")
         self.last_jump_price = None
-        self.last_mt5_move = None
+        self.last_coinbase_move = None
         self.directional_moves = deque(maxlen=3)
         self.discovery = Discovery(self.feed)
         self.samples, self.current_slug = deque(), None
-        self.mt5_offset = None
+        self.coinbase_offset = None
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
@@ -584,15 +617,16 @@ class PriceChart:
         cards = ttk.Frame(root, padding=(18, 0, 18, 10))
         cards.pack(fill="x")
         self.btc_card = self.card(cards, "POLYMARKET BTC-USD", BTC_COLOR)
-        self.mt5_card = self.card(cards, "METATRADER 5 BTCUSD ASK", MT5_COLOR)
+        self.coinbase_card = self.card(
+            cards, "COINBASE EXCHANGE BTC-USD", COINBASE_COLOR)
         self.up_card = self.card(cards, "POLYMARKET UP", UP_COLOR)
-        all_cards = (self.btc_card, self.mt5_card, self.up_card)
+        all_cards = (self.btc_card, self.coinbase_card, self.up_card)
         for index, card in enumerate(all_cards):
             card[0].pack(side="left", fill="x", expand=True,
                          padx=(0 if index == 0 else 3,
                                0 if index == len(all_cards) - 1 else 3))
         self.trade_banner = tk.Label(
-            root, text="POLYSIM: no trade yet", bg=BG, fg=MUTED,
+            root, text=f"{self.jump_trader.venue_name}: no trade yet", bg=BG, fg=MUTED,
             anchor="w", padx=20, pady=3, font=("Consolas", 10, "bold"))
         self.trade_banner.pack(fill="x")
         self.canvas = tk.Canvas(root, bg=PANEL, highlightthickness=0)
@@ -600,7 +634,7 @@ class PriceChart:
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.discovery.start()
         self.btc_feed.start()
-        self.mt5_feed.start()
+        self.coinbase_feed.start()
         self.tick()
 
     @staticmethod
@@ -619,39 +653,57 @@ class PriceChart:
     def tick(self):
         market, poly_error = self.discovery.snapshot()
         btc, price_to_beat, btc_error = self.btc_feed.snapshot()
-        mt5_price, mt5_error = self.mt5_feed.snapshot()
+        coinbase_price, coinbase_error = self.coinbase_feed.snapshot()
         quotes, now = self.feed.quotes(), time.monotonic()
         if market and market[0] != self.current_slug:
             self.current_slug = market[0]
             self.jump_trader.prepare(market[0])
             self.samples.clear()
             self.last_jump_price = None
-            self.last_mt5_move = None
+            self.last_coinbase_move = None
             self.directional_moves.clear()
-            self.mt5_offset = None
-        if btc is not None and mt5_price is not None and self.mt5_offset is None:
-            self.mt5_offset = btc - mt5_price
-        if mt5_price is not None and mt5_price != self.last_jump_price:
+            self.coinbase_offset = None
+        if (btc is not None and coinbase_price is not None and
+                self.coinbase_offset is None):
+            self.coinbase_offset = btc - coinbase_price
+        if coinbase_price is not None and coinbase_price != self.last_jump_price:
             previous_price = self.last_jump_price
-            self.last_mt5_move = (None if previous_price is None else
-                                  mt5_price - previous_price)
-            self.last_jump_price = mt5_price
+            self.last_coinbase_move = (None if previous_price is None else
+                                       coinbase_price - previous_price)
+            self.last_jump_price = coinbase_price
             market_open_for = (time.time() - (market[1] - 300)) if market else 0
             if market_open_for < TRADE_START_DELAY_SECONDS:
                 self.directional_moves.clear()
-            elif self.last_mt5_move is not None:
+            elif self.last_coinbase_move is not None:
                 if (self.directional_moves and
-                        self.directional_moves[-1] * self.last_mt5_move < 0):
+                        self.directional_moves[-1] * self.last_coinbase_move < 0):
                     self.directional_moves.clear()
-                self.directional_moves.append(self.last_mt5_move)
+                self.directional_moves.append(self.last_coinbase_move)
             signal = directional_jump(self.directional_moves,
                                       self.jump_threshold)
             if (signal and market and
                     market_open_for >= TRADE_START_DELAY_SECONDS):
                 outcome, move = signal
                 quote = quotes.get(outcome)
-                self.jump_trader.submit(
-                    market[0], outcome, move, quote.tick if quote else "0.01")
+                if quote is None:
+                    with self.jump_trader.lock:
+                        self.jump_trader.status = (
+                            f"skipped {outcome}: live ask unavailable")
+                    submitted = False
+                    self.directional_moves.clear()
+                elif not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
+                    with self.jump_trader.lock:
+                        self.jump_trader.status = (
+                            f"skipped {outcome}: ask {quote.ask:.3f} outside "
+                            f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
+                    submitted = False
+                    self.directional_moves.clear()
+                else:
+                    submitted = self.jump_trader.submit(
+                        market[0], outcome, move, quote.tick,
+                        token=market[2][outcome])
+                if submitted:
+                    self.directional_moves.clear()
         if btc is not None:
             self.btc_card[1].configure(text=f"${btc:,.2f}")
             if price_to_beat is not None:
@@ -660,16 +712,19 @@ class PriceChart:
                     text=f"to beat ${price_to_beat:,.2f}   delta {difference:+,.2f}")
             else:
                 self.btc_card[2].configure(text="waiting for price to beat")
-        if mt5_price is not None:
-            self.mt5_card[1].configure(text=f"${mt5_price:,.2f}", fg=MT5_COLOR)
-            move_text = ("waiting for next MT5 tick" if self.last_mt5_move is None
-                         else f"live move {self.last_mt5_move:+,.2f} USD")
-            offset_text = ("waiting for graph sync" if self.mt5_offset is None else
-                           f"offset {self.mt5_offset:+,.2f}")
-            self.mt5_card[2].configure(
+        if coinbase_price is not None:
+            self.coinbase_card[1].configure(
+                text=f"${coinbase_price:,.2f}", fg=COINBASE_COLOR)
+            move_text = ("waiting for next Coinbase tick"
+                         if self.last_coinbase_move is None else
+                         f"live move {self.last_coinbase_move:+,.2f} USD")
+            offset_text = ("waiting for graph sync"
+                           if self.coinbase_offset is None else
+                           f"offset {self.coinbase_offset:+,.2f}")
+            self.coinbase_card[2].configure(
                 text=f"{move_text}   |   {offset_text}",
-                fg=(UP_COLOR if (self.last_mt5_move or 0) > 0 else
-                    DOWN_COLOR if (self.last_mt5_move or 0) < 0 else MUTED))
+                fg=(UP_COLOR if (self.last_coinbase_move or 0) > 0 else
+                    DOWN_COLOR if (self.last_coinbase_move or 0) < 0 else MUTED))
         up, down = quotes.get("Up"), quotes.get("Down")
         position = self.jump_trader.position(market[0]) if market else None
         latest_trade = self.jump_trader.latest_trade()
@@ -685,7 +740,8 @@ class PriceChart:
                     if latest_trade.get("move") is not None else "")
             state = str(latest_trade.get("entry_state") or "signal").upper()
             self.trade_banner.configure(
-                text=(f"POLYSIM: {state} {latest_trade['outcome']}{entry}"
+                text=(f"{self.jump_trader.venue_name}: {state} "
+                      f"{latest_trade['outcome']}{entry}"
                       f"{shares}{target}{jump} | {latest_trade['market']}"),
                 fg=UP_COLOR if state == "FILLED" else DOWN_COLOR)
         if up:
@@ -694,15 +750,17 @@ class PriceChart:
                 f"   POS {position['outcome']} @ UP {position['entry']:.3f}")
             self.up_card[2].configure(
                 text=f"bid {up.bid:.3f}   ask {up.ask:.3f}{position_text}")
-        if btc is not None or mt5_price is not None or up or down:
-            synced_mt5 = (None if mt5_price is None or self.mt5_offset is None
-                          else mt5_price + self.mt5_offset)
-            self.samples.append((now, synced_mt5,
+        if btc is not None or coinbase_price is not None or up or down:
+            synced_coinbase = (
+                None if coinbase_price is None or self.coinbase_offset is None
+                else coinbase_price + self.coinbase_offset)
+            self.samples.append((now, synced_coinbase,
                                  None if up is None else float(up.probability),
                                  None if down is None else float(down.probability)))
             while self.samples and self.samples[0][0] < now - WINDOW_SECONDS:
                 self.samples.popleft()
-        errors = " | ".join(filter(None, (poly_error, btc_error, mt5_error)))
+        errors = " | ".join(filter(
+            None, (poly_error, btc_error, coinbase_error)))
         if market:
             remaining = max(0, int(market[1] - time.time()))
             trade_status = self.jump_trader.snapshot()
@@ -739,15 +797,17 @@ class PriceChart:
             probability = 1 - index / 4
             c.create_line(left, y, right, y, fill=GRID)
             c.create_text(left - 10, y, text=f"${btc_value:,.0f}",
-                          fill=MT5_COLOR, anchor="e")
+                          fill=COINBASE_COLOR, anchor="e")
             c.create_text(right + 10, y, text=f"{probability:.2f}",
                           fill=MUTED, anchor="w")
-        c.create_text(left, 18, text="MT5 ASK (synced)",
-                      fill=MT5_COLOR, anchor="w")
+        c.create_text(left, 18, text="Coinbase BTC-USD (synced)",
+                      fill=COINBASE_COLOR, anchor="w")
         c.create_text(left + 155, 18, text="Polymarket Up",
                       fill=UP_COLOR, anchor="w")
-        trend_points = [(stamp, mt5_price) for stamp, mt5_price, _, _ in self.samples
-                        if mt5_price is not None and stamp >= now - TREND_SECONDS]
+        trend_points = [
+            (stamp, coinbase_price)
+            for stamp, coinbase_price, _, _ in self.samples
+            if coinbase_price is not None and stamp >= now - TREND_SECONDS]
         trend = price_trend(trend_points)
         if trend:
             direction, move, _, _ = trend
@@ -758,7 +818,8 @@ class PriceChart:
                           text=f"{arrow} {direction} {move:+.2f} / {TREND_SECONDS:.0f}s",
                           fill=trend_color, anchor="w",
                           font=("Consolas", 10, "bold"))
-        c.create_text(left - 10, top - 8, text="BTC $", fill=MT5_COLOR, anchor="e")
+        c.create_text(left - 10, top - 8, text="BTC $",
+                      fill=COINBASE_COLOR, anchor="e")
         c.create_text(right + 10, top - 8, text="Probability", fill=MUTED, anchor="w")
         if price_to_beat is not None:
             beat_y = bottom - (price_to_beat-low)/(high-low)*(bottom-top)
@@ -789,15 +850,15 @@ class PriceChart:
         if len(self.samples) < 2:
             return
         start = now - WINDOW_SECONDS
-        points = {"mt5": [], "up": []}
-        for stamp, mt5_price, up, down in self.samples:
+        points = {"coinbase": [], "up": []}
+        for stamp, coinbase_price, up, down in self.samples:
             x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
-            if mt5_price is not None:
-                points["mt5"] += [
-                    x, bottom - (mt5_price-low)/(high-low)*(bottom-top)]
+            if coinbase_price is not None:
+                points["coinbase"] += [
+                    x, bottom - (coinbase_price-low)/(high-low)*(bottom-top)]
             if up is not None:
                 points["up"] += [x, bottom - up * (bottom-top)]
-        for name, color in (("mt5", MT5_COLOR), ("up", UP_COLOR)):
+        for name, color in (("coinbase", COINBASE_COLOR), ("up", UP_COLOR)):
             if len(points[name]) >= 4:
                 c.create_line(*points[name], fill=color, width=2, smooth=True)
         if trend:
@@ -814,7 +875,7 @@ class PriceChart:
     def close(self):
         self.discovery.stop.set()
         self.btc_feed.stop.set()
-        self.mt5_feed.stop.set()
+        self.coinbase_feed.stop.set()
         self.jump_trader.close()
         self.feed.generation += 1
         self.root.destroy()

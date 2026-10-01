@@ -22,8 +22,8 @@ LOG = logging.getLogger("opening-bot")
 API = "https://api.polysimulator.com/v1/"
 
 
-def profit_target(price, tick):
-    return (price * Decimal("1.10") / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+def profit_target(price, tick, rate=Decimal("0.10")):
+    return (price * (Decimal("1") + rate) / tick).to_integral_value(rounding=ROUND_CEILING) * tick
 
 
 class OpeningBot:
@@ -32,9 +32,11 @@ class OpeningBot:
     simulator_get = Bot.simulator_get
 
     def __init__(self, asset="btc", amount=Decimal("5"), paper=False,
-                 entry_window=30, db_path=None, http_client=None):
+                 entry_window=30, db_path=None, http_client=None,
+                 take_profit=Decimal("0.10")):
         self.asset, self.amount, self.paper = asset, amount, paper
         self.entry_window = entry_window
+        self.take_profit = Decimal(take_profit)
         self.api_key = os.environ.get("POLYSIM_API_KEY", "").strip()
         if not self.api_key:
             raise ValueError("Set POLYSIM_API_KEY in .env")
@@ -70,7 +72,8 @@ class OpeningBot:
             return f"HTTP {exc.response.status_code}: " + exc.response.text.replace(self.api_key, "[REDACTED]")[:2000]
         return type(exc).__name__
 
-    def enter(self, slug, end, outcome, token, direct_tick=None):
+    def enter(self, slug, end, outcome, token, direct_tick=None,
+              direct_limit=Decimal("0.99")):
         start = end - 300
         if not start <= time.time() < start + self.entry_window:
             return
@@ -85,7 +88,10 @@ class OpeningBot:
             tick = Decimal(str(direct_tick))
             if not tick.is_finite() or not 0 < tick < 1:
                 raise ValueError("invalid direct quote tick")
-            limit = (Decimal("0.99") / tick).to_integral_value(
+            direct_limit = Decimal(direct_limit)
+            if not direct_limit.is_finite() or not 0 < direct_limit < 1:
+                raise ValueError("invalid direct price limit")
+            limit = (direct_limit / tick).to_integral_value(
                 rounding=ROUND_FLOOR) * tick
         else:
             data = self.simulator_get("book", token_id=token)
@@ -158,7 +164,8 @@ class OpeningBot:
             if time.time() >= row["end"]:
                 self.update(slug, outcome, tp_state="expired")
                 continue
-            target = profit_target(Decimal(row["price"]), Decimal(row["tick"]))
+            target = profit_target(Decimal(row["price"]), Decimal(row["tick"]),
+                                   self.take_profit)
             if target >= 1:
                 self.update(slug, outcome, tp_state="unreachable")
                 LOG.warning("TP unreachable below $1: %s %s", slug, outcome)

@@ -50,6 +50,8 @@ class OpeningBotTests(unittest.TestCase):
 
     def test_profit_target_rounds_up_to_tick(self):
         self.assertEqual(profit_target(Decimal("0.51"), Decimal("0.01")), Decimal("0.57"))
+        self.assertEqual(profit_target(Decimal("0.51"), Decimal("0.01"),
+                                       Decimal("0.05")), Decimal("0.54"))
 
     def test_midwindow_does_not_buy(self):
         with patch("opening_bot.time.time", return_value=3031):
@@ -98,6 +100,11 @@ class OpeningBotTests(unittest.TestCase):
         self.bot.enter(self.bot.market[0], 3300, "Up", "up", direct_tick="0.01")
         self.assertEqual(get_calls, 0)
         self.assertEqual(self.orders[0]["price"], "0.99")
+
+    def test_direct_entry_honors_absolute_price_cap(self):
+        self.bot.enter(self.bot.market[0], 3300, "Up", "up",
+                       direct_tick="0.01", direct_limit=Decimal("0.90"))
+        self.assertEqual(self.orders[0]["price"], "0.90")
 
 
 if __name__ == "__main__":
