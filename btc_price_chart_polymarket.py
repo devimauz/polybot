@@ -44,6 +44,7 @@ TRADE_START_DELAY_SECONDS = 5.0
 TRADE_COOLDOWN_SECONDS = 0.0
 MAX_TRADES_PER_WINDOW = 3
 JUMP_TP_RATE = Decimal("0.10")
+JUMP_NOISE_USD = 0.05
 MIN_ENTRY_PRICE = Decimal("0.30")
 MAX_ENTRY_PRICE = Decimal("0.70")
 STAKE = Decimal("1.10")
@@ -401,6 +402,20 @@ class EventDrivenJumpDetector:
             market_age = time.time() - (market[1] - 300)
             if market_age < TRADE_START_DELAY_SECONDS:
                 self.moves.clear()
+                return
+            if abs(self.last_move) <= JUMP_NOISE_USD + 1e-9:
+                quotes = self.market_feed.quotes()
+                up_quote, down_quote = quotes.get("Up"), quotes.get("Down")
+                self.history.append({
+                    "timestamp": time.time(), "price": price,
+                    "delta": self.last_move,
+                    "direction": "NOISE",
+                    "streak_count": len(self.moves),
+                    "streak_total": float(sum(self.moves)),
+                    "up_ask": None if up_quote is None else float(up_quote.ask),
+                    "down_ask": None if down_quote is None else float(down_quote.ask),
+                    "action": "ignored noise", "request_id": None,
+                })
                 return
             if self.last_move is not None:
                 if self.moves and self.moves[-1] * self.last_move < 0:

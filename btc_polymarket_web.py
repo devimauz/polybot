@@ -20,7 +20,8 @@ from fastapi.responses import HTMLResponse
 from bot import ROOT
 import btc_price_chart_polymarket as strategy
 from btc_price_chart_polymarket import (
-    ENTRY_SLIPPAGE, FRAME_MS, MAX_ENTRY_PRICE, MAX_TRADES_PER_WINDOW,
+    ENTRY_SLIPPAGE, FRAME_MS, JUMP_NOISE_USD, MAX_ENTRY_PRICE,
+    MAX_TRADES_PER_WINDOW,
     MIN_ENTRY_PRICE,
     SELL_RETRY_SECONDS, SELL_RETRY_WINDOW_SECONDS, STAKE, TAKE_PROFIT,
     TRADE_START_DELAY_SECONDS,
@@ -169,6 +170,7 @@ class WebTradingEngine:
                                "trade_start_delay_seconds": float(TRADE_START_DELAY_SECONDS),
                                "trade_cooldown_seconds": TRADE_COOLDOWN_SECONDS,
                                "history_seconds": HISTORY_SECONDS},
+                    "jump_noise_filter_usd": JUMP_NOISE_USD,
                     "max_trades_per_window": MAX_TRADES_PER_WINDOW,
                     "trade_count": current_trade_count,
                     "up": self._quote(quotes.get("Up")),
@@ -209,7 +211,7 @@ HTML = r'''<!doctype html>
  </section>
  <section class="card" style="grid-column:span 12"><h2>Synced Coinbase BTC + Polymarket UP + open trade</h2><canvas id="sharedChart" style="height:390px"></canvas></section>
  <section class="card third"><h2>Order book</h2><table><thead><tr><th>Outcome</th><th>Bid</th><th>Ask</th><th>Mid</th><th>Spread</th></tr></thead><tbody><tr class="up"><td>UP</td><td id="ub">--</td><td id="ua">--</td><td id="um">--</td><td id="us">--</td></tr><tr class="down"><td>DOWN</td><td id="db">--</td><td id="da">--</td><td id="dm">--</td><td id="ds">--</td></tr></tbody></table></section>
- <section class="card third"><h2>Signal</h2><div class="rows"><div>Trend</div><div id="trend">--</div><div>Sequence</div><div id="sequence">--</div><div>Threshold</div><div id="threshold">--</div><div>Entry filter</div><div id="filter">--</div></div></section>
+ <section class="card third"><h2>Signal</h2><div class="rows"><div>Trend</div><div id="trend">--</div><div>Sequence</div><div id="sequence">--</div><div>Threshold</div><div id="threshold">--</div><div>Noise filter</div><div id="noiseFilter">--</div><div>Entry filter</div><div id="filter">--</div></div></section>
  <section class="card third"><h2>Market</h2><div class="rows"><div>Slug</div><div id="market">--</div><div>Elapsed</div><div id="elapsed">--</div><div>Synced price</div><div id="synced">--</div><div>Offset</div><div id="offset">--</div><div>Trades this window</div><div id="tradeCount">--</div><div>Order warmup</div><div id="warmup">--</div></div></section>
  <section class="card half"><h2>Trader status</h2><div class="status" id="status">Starting…</div></section>
  <section class="card half"><h2>Position / software sell</h2><div class="status" id="trade">No trade in this process.</div></section>
@@ -229,7 +231,7 @@ const activity=[],seen={};function addEvent(type,message){activity.unshift({time
 function enrich(s){$('progress').style.width=(s.market_progress||0)+'%';$('elapsed').textContent=num(s.market_elapsed,1)+'s / 300s';$('tradeCount').textContent=`${s.trade_count??'--'} / ${s.max_trades_per_window??'--'}`;const c=s.config||{};$('cfgStake').textContent=money(c.stake);$('cfgTp').textContent=num(c.take_profit_pct,1)+'%';$('cfgEntrySlip').textContent=num(c.entry_slippage,2);$('cfgExitMode').textContent=c.exit_mode||'--';$('cfgRetry').textContent=(c.sell_retry_ms??'--')+'ms';$('cfgWindow').textContent=num(c.sell_window_seconds,1)+'s';const p=s.position||{};$('posOutcome').textContent=p.outcome||'--';$('posEntry').textContent=num(p.entry);$('posTarget').textContent=num(p.target);$('posShares').textContent=num(p.shares,6);$('posState').textContent=p.tp_state||'--';if(s.trade?.detail)$('trade').textContent+=' | '+s.trade.detail;changed('market',s.market,'MARKET','Switched to '+(s.market||'none'));changed('status',s.trader_status,'TRADER',s.trader_status||'--');const tradeKey=s.trade?JSON.stringify([s.trade.market,s.trade.entry_state,s.trade.tp_state,s.trade.price,s.trade.shares,s.trade.detail]):'none';changed('trade',tradeKey,'POSITION',s.trade?`${s.trade.outcome} entry=${num(s.trade.price)} shares=${num(s.trade.shares,6)} target=${num(s.trade.target)} state=${s.trade.tp_state||s.trade.entry_state}${s.trade.detail?' detail='+s.trade.detail:''}`:'No active trade');const errorKey=JSON.stringify([...(s.errors||[]),s.engine_error].filter(Boolean));changed('errors',errorKey,'FEEDS',errorKey==='[]'?'All feeds connected':errorKey);const safe={...s,btc_history:`${s.btc_history?.length||0} samples`,up_history:`${s.up_history?.length||0} samples`};$('raw').textContent=JSON.stringify(safe,null,2)}
 function renderRows(id,rows,cells,rowClass){const body=$(id),fragment=document.createDocumentFragment();for(const row of rows){const tr=document.createElement('tr');if(rowClass)tr.className=rowClass(row);for(const value of cells(row)){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}fragment.appendChild(tr)}body.replaceChildren(fragment)}
 function renderMonitoring(s){const jumps=[...(s.jump_history||[])].reverse();renderRows('jumpRows',jumps,j=>[new Date(j.timestamp*1000).toLocaleTimeString(),j.direction,money(j.price),(j.delta>=0?'+':'')+num(j.delta,2),j.streak_count,(j.streak_total>=0?'+':'')+num(j.streak_total,2),num(j.up_ask),num(j.down_ask),j.action],j=>j.action.includes('queued')?'up':j.action.includes('skipped')?'down':'');const timings=[...(s.execution_timings||[])].reverse();const ms=v=>v==null?'--':num(v,2)+' ms';renderRows('timingRows',timings,t=>[new Date(t.timestamp*1000).toLocaleTimeString(),t.outcome,(t.move>=0?'+':'')+num(t.move,2),ms(t.detected_to_queue_ms),ms(t.queue_wait_ms),ms(t.request_ms),ms(t.total_ms),t.result],t=>t.result==='filled'?'up':t.result==='rejected'||String(t.result).includes('error')?'down':'')}
-const enrichBase=enrich;enrich=s=>{enrichBase(s);$('warmup').textContent=s.warmup_status||'--'};
+const enrichBase=enrich;enrich=s=>{enrichBase(s);$('warmup').textContent=s.warmup_status||'--';$('noiseFilter').textContent='ignore <= '+num(s.jump_noise_filter_usd,2)+' USD'};
 const basicUpdate=update;update=s=>{basicUpdate(s);enrich(s);renderMonitoring(s)};
 async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});update(await r.json())}catch(e){$('errors').textContent='Dashboard connection lost: '+e;$('errors').className='status error'}}setInterval(poll,100);poll();addEventListener('resize',poll);
 </script></body></html>'''
