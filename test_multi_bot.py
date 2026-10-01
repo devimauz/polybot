@@ -26,23 +26,23 @@ class MultiBotTests(unittest.TestCase):
     def tearDown(self):
         self.bot.journal.db.close()
 
-    def test_five_asset_orders_and_restart_protection(self):
-        self.assertEqual(self.bot.assets, ("sol", "doge", "xrp", "eth", "bnb"))
+    def test_four_asset_orders_and_restart_protection(self):
+        self.assertEqual(self.bot.assets, ("sol", "doge", "eth", "bnb"))
         self.assertTrue(self.bot.cycle())
-        self.assertEqual(self.bot.client.post_order.call_count, 5)
-        self.assertEqual([call.args[0].token_id for call in self.bot.client.create_market_order.call_args_list], ["sol", "doge", "xrp", "eth", "bnb"])
+        self.assertEqual(self.bot.client.post_order.call_count, 4)
+        self.assertEqual([call.args[0].token_id for call in self.bot.client.create_market_order.call_args_list], ["sol", "doge", "eth", "bnb"])
         for call in self.bot.client.create_market_order.call_args_list:
             self.assertEqual(call.args[0].amount, float(MultiBot.amount))
             self.assertEqual(call.args[0].user_usdc_balance, 0)
             self.assertEqual(call.args[0].order_type, "FOK")
-        self.assertEqual(self.bot.journal.db.execute("SELECT SUM(amount) FROM orders").fetchone()[0], float(MultiBot.amount * 5))
+        self.assertEqual(self.bot.journal.db.execute("SELECT SUM(amount) FROM orders").fetchone()[0], float(MultiBot.amount * 4))
         self.bot.cycle()
-        self.assertEqual(self.bot.client.post_order.call_count, 5)
+        self.assertEqual(self.bot.client.post_order.call_count, 4)
 
     def test_data_failure_does_not_skip_other_assets(self):
-        self.bot.step = Mock(side_effect=[httpx.ConnectError("offline")] + [None] * 4)
+        self.bot.step = Mock(side_effect=[httpx.ConnectError("offline")] + [None] * 3)
         self.assertFalse(self.bot.cycle())
-        self.assertEqual(self.bot.step.call_count, 5)
+        self.assertEqual(self.bot.step.call_count, 4)
 
     def test_unknown_order_stops_cycle(self):
         self.bot.client.post_order.side_effect = ValueError("invalid submission")
@@ -53,11 +53,11 @@ class MultiBotTests(unittest.TestCase):
     def test_fok_rejection_continues_to_other_assets(self):
         from py_clob_client_v2.exceptions import PolyApiException
         error = PolyApiException(httpx.Response(400, json={"error": "order couldn't be fully filled. FOK orders are fully filled or killed."}))
-        self.bot.client.post_order.side_effect = [error] + [{"success": True, "status": "matched"}] * 4
+        self.bot.client.post_order.side_effect = [error] + [{"success": True, "status": "matched"}] * 3
         self.assertTrue(self.bot.cycle())
-        self.assertEqual(self.bot.client.post_order.call_count, 5)
+        self.assertEqual(self.bot.client.post_order.call_count, 4)
         self.bot.cycle()
-        self.assertEqual(self.bot.client.post_order.call_count, 5)
+        self.assertEqual(self.bot.client.post_order.call_count, 4)
         self.assertEqual(self.bot.journal.db.execute("SELECT status FROM orders WHERE market='sol-market'").fetchone()[0], "rejected")
 
 

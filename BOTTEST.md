@@ -43,7 +43,7 @@ Positions are held to resolution; this version does not submit exits.
 
 ## Journals, logs, and settlement
 
-`multi_bottest.py` runs the same experimental strategy for SOL, DOGE, XRP, ETH,
+`multi_bottest.py` runs the same experimental strategy for SOL, DOGE, ETH,
 and BNB. It accepts the same command-line settings as `bottest.py`:
 
 ```powershell

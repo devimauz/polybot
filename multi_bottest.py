@@ -1,4 +1,4 @@
-"""SOL, DOGE, XRP, ETH and BNB runner using bottest.py. Dry run by default."""
+"""SOL, DOGE, ETH and BNB runner using bottest.py. Dry run by default."""
 
 import logging
 import os
@@ -12,7 +12,7 @@ from bottest import AMOUNT, Bot, LOG, ROOT, STRATEGY_VERSION, argument_parser, s
 
 class MultiBot(Bot):
     amount = AMOUNT
-    assets = ("sol", "doge", "xrp", "eth", "bnb")
+    assets = ("sol", "doge", "eth", "bnb")
     asset = "sol"
     journal_prefix = "multi-"
 

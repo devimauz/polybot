@@ -34,7 +34,7 @@ class PriceLogTests(unittest.TestCase):
                 self.assertEqual(rows[1]["asset"], asset.upper())
                 self.assertEqual(rows[2]["mode"], "dry-run")
                 self.assertIsNone(rows[2]["fill_price"])
-            self.assertEqual(len(list(directory.glob("*.jsonl"))), 6)
+            self.assertEqual(len(list(directory.glob("*.jsonl"))), 5)
 
     def test_unwritable_log_does_not_interrupt_bot(self):
         bot = Bot.__new__(Bot)

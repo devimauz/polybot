@@ -50,9 +50,14 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("twap-bot")
 API = "https://api.polysimulator.com/v1"
-BINANCE = "https://api.binance.com"
-ASSETS = ("btc", "sol", "xrp", "eth", "bnb")
-SYMBOL = {a: a.upper() + "USDT" for a in ASSETS}
+CB = "https://api.exchange.coinbase.com"
+CB_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"),
+    "Accept": "application/json",
+}
+ASSETS = ("btc", "sol", "eth", "bnb")
+CB_SYMBOL = {a: a.upper() + "-USD" for a in ASSETS}
 WINDOW = 300
 FEE_R = 0.05            # taker fee = 0.05 * min(p, 1-p) * shares
 POLL = 0.5
@@ -62,15 +67,15 @@ SKIP_T_LO = 100         # skip the 100-110s rebalance dip (74% and 43% win in bo
 SKIP_T_HI = 110
 MAX_T = 295             # endgame-only: the official Chainlink open (group_item_threshold) is
                         # only published at t~234s, so the model can only trade the last ~60s
-SD_FLOOR_FRAC = 0.001   # floor sd at 0.1% of spot: Binance/Chainlink basis + model error
+SD_FLOOR_FRAC = 0.001   # floor sd at 0.1% of spot: Coinbase/Chainlink basis + model error
 # Confident-tail strategy (calibrated on live TWAP outcomes):
 #   Only buy the side the model is CONFIDENT in, and only when the market is
 #   lagging (ask clearly below model prob). The model is accurate in the
 #   confident tails (model>=0.80 -> favored side wins) but wrong in the
 #   middle (model~0.50), so we never buy the cheap laggard at 0.25-0.50.
-CONF_MIN_FAV = 0.85     # require model prob >= 0.85 (fresh $100 session: 0.80-0.84 band was 6W-3L -$182; >=0.85 is +$255)
-ASK_LO = 0.60           # don't buy below this (0.50-0.60 cheap asks: 3 of 11 losses this session)
-ASK_HI = 0.88           # don't pay near-certainty (no edge left after fee)
+CONF_MIN_FAV = 0.76     # require model prob >= 0.85 (fresh $100 session: 0.80-0.84 band was 6W-3L -$182; >=0.85 is +$255)
+ASK_LO = 0.65           # don't buy below this (0.50-0.60 cheap asks: 3 of 11 losses this session)
+ASK_HI = 0.85           # don't pay near-certainty (no edge left after fee)
 GAP_MIN = 0.08          # require model_prob - ask >= 8c (grid search: bigger lag = fatter wins; 0.08 was best across all 3 data chunks)
 SESSION_LOSS_CAP = 1000.0 # stop trading for the session after losing this much (raised to 1000: user wants the full overnight run unobstructed)
 WINDOW_EXPOSURE_CAP = 2 # max same-side fills per 5m window (3+ same-side clusters
@@ -113,30 +118,38 @@ class WindowModel:
     def sigma_s(self):
         return self.sigma_min / 60.0
 
-    def sample(self, bnc):
+    def sample(self, cb):
         now = time.time()
         if now - self.last_sample < 0.4:
             return
         self.last_sample = now
         try:
-            self.spot = float(bnc.get(BINANCE + "/api/v3/ticker/price",
-                                      params={"symbol": SYMBOL[self.asset]},
-                                      timeout=4).json()["price"])
+            self.spot = float(cb.get(CB + "/products/" + CB_SYMBOL[self.asset] + "/ticker",
+                                     headers=CB_HEADERS, timeout=4).json()["price"])
         except (httpx.HTTPError, KeyError, ValueError):
             return
+        # CB /trades returns the LAST N trades (no startTime cursor), so dedupe
+        # by trade timestamp against the path already collected this window.
         try:
-            r = bnc.get(BINANCE + "/api/v3/aggTrades",
-                        params={"symbol": SYMBOL[self.asset],
-                                "startTime": self.last_fetch_ms,
-                                "limit": 1000}, timeout=5)
+            r = cb.get(CB + "/products/" + CB_SYMBOL[self.asset] + "/trades",
+                       headers=CB_HEADERS, params={"limit": 1000}, timeout=5)
             batch = r.json()
+            last_ts = max((off for off, _ in self.path), default=None)
+            added = 0
             for t in batch:
-                ts = float(t["T"]) / 1000
+                try:
+                    ts = datetime.fromisoformat(t["time"].replace("Z", "+00:00")).timestamp()
+                except (KeyError, ValueError, TypeError):
+                    continue
                 off = ts - self.start
-                if 0 <= off <= now - self.start:
-                    self.path.append((off, float(t["p"])))
-            if batch:
-                self.last_fetch_ms = int(batch[-1]["T"]) + 1
+                if not (0 <= off <= now - self.start):
+                    continue
+                if last_ts is not None and ts <= last_ts:
+                    continue  # already collected
+                self.path.append((off, float(t["price"])))
+                added += 1
+            if added:
+                self.path.sort(key=lambda x: x[0])
             self.path = self.path[-4000:]
         except (httpx.HTTPError, ValueError):
             pass
@@ -171,7 +184,7 @@ class WindowModel:
         # Var[final_TWAP | past] in price^2 units
         var = self.spot ** 2 * sigma ** 2 * r ** 3 / (3 * T * T)
         sd = math.sqrt(max(var, 1e-18))
-        # Floor: residual Binance-vs-Chainlink basis + discretisation + any
+        # Floor: residual Coinbase-vs-Chainlink basis + discretisation + any
         # model error. Keeps z from saturating in the endgame.
         sd = max(sd, SD_FLOOR_FRAC * self.spot)
         z = (e_final - self.ref) / sd
@@ -237,7 +250,7 @@ def main():
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("log", "paper"), default="log")
-    parser.add_argument("--assets", nargs="+", default=list(ASSETS))
+    parser.add_argument("--assets", nargs="+", choices=ASSETS, default=list(ASSETS))
     parser.add_argument("--poll", type=float, default=POLL)
     parser.add_argument("--stake", type=float, default=100.0)
     parser.add_argument("--edge", type=float, default=EDGE_FRAC,
@@ -254,7 +267,7 @@ def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     sim = httpx.Client(timeout=10, headers={"X-API-Key": api_key})
-    bnc = httpx.Client(timeout=8)
+    cb = httpx.Client(timeout=8)
     clob = httpx.Client(timeout=10)  # Polymarket public CLOB (settlement)
     log = Logger(ROOT / "price_logs" / "twap" / "windows.jsonl")
     journal_path = ROOT / "price_logs" / "twap" / "trades.jsonl"
@@ -309,7 +322,7 @@ def main():
 
     def win_of(p):
         """Determine the resolved outcome for pending entry p (dict with
-        'cid', 'slug'). CLOB-only sources (no Binance):
+        'cid', 'slug'). CLOB-only sources (no Coinbase):
           'clob'    — official tokens[].winner flag (authoritative; posted
                       ~30 min after close).
           'polysim' — Polysimulator order book fully converged on one
@@ -353,13 +366,13 @@ def main():
         return None, None
 
 
-    def binance_win(slug, bnc_client):
-        """Recompute the 5m TWAP outcome from Binance aggTrades.
-        Resolves 'Up' if TWAP(open->close) >= open price (>= rule, matches the
-        market threshold definition)."""
+    def cb_win(slug, cb_client):
+        """Recompute the 5m TWAP outcome from Coinbase Exchange 1-minute
+        candles. Resolves 'Up' if TWAP(open->close) >= open price (>= rule,
+        matches the market threshold definition)."""
         asset = slug.split("-updown")[0]
-        sym = SYMBOL.get(asset)
-        if not sym:
+        prod = CB_SYMBOL.get(asset)
+        if not prod:
             return None
         try:
             start = int(slug.rsplit("-", 1)[1])
@@ -367,38 +380,30 @@ def main():
             return None
         end = start + WINDOW
         try:
-            r = bnc_client.get(BINANCE + "/api/v3/klines",
-                               params={"symbol": sym, "interval": "1m",
-                                       "startTime": start * 1000, "limit": 1},
-                               timeout=6)
+            r = cb_client.get(CB + "/products/" + prod + "/candles",
+                              headers=CB_HEADERS,
+                              params={"granularity": 60, "start": start, "end": end},
+                              timeout=6)
             kl = r.json()
             if not kl:
                 return None
-            open_p = float(kl[0][1])
+            # CB candle: [ts, low, high, open, close, volume]
+            open_p = float(kl[0][3])
             if open_p <= 0:
                 return None
-            cur = open_p
-            last_t = float(start)
             integ = 0.0
-            cur_ms = start * 1000
-            calls = 0
-            while cur_ms < end * 1000 and calls < 60:
-                r = bnc_client.get(BINANCE + "/api/v3/aggTrades",
-                                   params={"symbol": sym, "startTime": cur_ms,
-                                           "limit": 1000}, timeout=6)
-                batch = r.json()
-                if not batch:
-                    break
-                calls += 1
-                for t in batch:
-                    ts = float(t["T"]) / 1000
-                    if ts >= end:
-                        break
-                    integ += (ts - last_t) * cur
-                    last_t = ts
-                    cur = float(t["p"])
-                cur_ms = int(batch[-1]["T"]) + 1
-            integ += (end - last_t) * cur
+            for i, k in enumerate(kl):
+                ts = float(k[0])
+                close = float(k[4])
+                nxt = float(kl[i + 1][0]) if i + 1 < len(kl) else end
+                lo = max(ts, start)
+                hi = min(nxt, end)
+                if hi <= lo:
+                    continue
+                if i == 0:
+                    integ += (hi - lo) * open_p  # first candle: open is window start
+                else:
+                    integ += (hi - lo) * close
             twap = integ / float(WINDOW)
             return "Up" if twap >= open_p else "Down"
         except (httpx.HTTPError, ValueError, KeyError, IndexError):
@@ -448,9 +453,10 @@ def main():
 
     def fit_sigma(asset):
         try:
-            r = bnc.get(BINANCE + "/api/v3/klines",
-                        params={"symbol": SYMBOL[asset], "interval": "1m", "limit": 30},
-                        timeout=6)
+            r = cb.get(CB + "/products/" + CB_SYMBOL[asset] + "/candles",
+                       headers=CB_HEADERS,
+                       params={"granularity": 60, "start": int(time.time()) - 1800,
+                               "end": int(time.time())}, timeout=6)
             return sigma_1m(r.json())
         except httpx.HTTPError:
             return 0.0
@@ -474,7 +480,7 @@ def main():
                         # Trust ONLY the official Chainlink window-open
                         # (group_item_threshold). If it isn't available yet,
                         # wait for it on the next poll — never substitute a
-                        # Binance price (that reference is what settlement
+                        # Coinbase price (that reference is what settlement
                         # compares against, so it must be the real one).
                         ref = float(thr) if thr else None
                         if ref is None:
@@ -488,7 +494,7 @@ def main():
                              time.time() - sigma_cache[asset].get("ts", 0) > 120):
                         sigma_cache[asset] = {"val": fit_sigma(asset), "ts": time.time()}
                         m.sigma_min = sigma_cache[asset]["val"]
-                    m.sample(bnc)
+                    m.sample(cb)
                     p_up, info = m.fair()
 
                     rec = {"t": datetime.now(timezone.utc).isoformat(), "asset": asset,
@@ -618,7 +624,7 @@ def main():
         log.close()
         journal.close()
         sim.close()
-        bnc.close()
+        cb.close()
 
 
 if __name__ == "__main__":

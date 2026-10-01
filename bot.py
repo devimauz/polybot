@@ -229,7 +229,7 @@ class Journal:
 class Bot:
     journal_type = Journal
     amount = AMOUNT
-    assets = ("btc", "sol", "doge", "xrp", "eth", "bnb")
+    assets = ("btc", "sol", "doge", "eth", "bnb")
     asset = "sol"
     journal_prefix = ""
     price_log_dir = ROOT / "price_logs" / "polysimulator"
@@ -422,7 +422,10 @@ class Bot:
             return {"success": False, "status": status, "raw": payload}
         price = D(str(payload["price"]))
         shares = D(str(payload["quantity"]))
-        if not price.is_finite() or not shares.is_finite() or not 0 < price <= D(signed["price"]) or shares <= 0:
+        limit = D(signed["price"])
+        price_ok = (price <= limit if signed.get("side") == "BUY" else price >= limit)
+        if (not price.is_finite() or not shares.is_finite() or not limit.is_finite()
+                or not 0 < price < D(1) or not price_ok or shares <= 0):
             raise ValueError("Invalid Polysimulator fill; reconcile the journal")
         return {
             "success": True, "status": "matched",

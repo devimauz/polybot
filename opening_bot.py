@@ -31,13 +31,15 @@ class OpeningBot:
     discover = Bot.discover
     simulator_get = Bot.simulator_get
 
-    def __init__(self, asset="btc", amount=Decimal("5"), paper=False, entry_window=30, db_path=None):
+    def __init__(self, asset="btc", amount=Decimal("5"), paper=False,
+                 entry_window=30, db_path=None, http_client=None):
         self.asset, self.amount, self.paper = asset, amount, paper
         self.entry_window = entry_window
         self.api_key = os.environ.get("POLYSIM_API_KEY", "").strip()
         if not self.api_key:
             raise ValueError("Set POLYSIM_API_KEY in .env")
-        self.http = httpx.Client(timeout=10)
+        self._owns_http = http_client is None
+        self.http = http_client or httpx.Client(timeout=10)
         self.market = None
         self.condition_id = None
         name = "opening-paper.sqlite3" if paper else "opening-dry-run.sqlite3"
@@ -68,7 +70,7 @@ class OpeningBot:
             return f"HTTP {exc.response.status_code}: " + exc.response.text.replace(self.api_key, "[REDACTED]")[:2000]
         return type(exc).__name__
 
-    def enter(self, slug, end, outcome, token):
+    def enter(self, slug, end, outcome, token, direct_tick=None):
         start = end - 300
         if not start <= time.time() < start + self.entry_window:
             return
@@ -76,20 +78,30 @@ class OpeningBot:
                                    (slug, outcome)).fetchone()
         if previous and (previous["entry_state"] != "retry" or previous["retry_at"] > time.time()):
             return
-        data = self.simulator_get("book", token_id=token)
-        ask, tick = book_quote(data, time.time())
-        if not ask:
-            return
-        # Leave room for a 10% target below the $1 payout ceiling.
-        ceiling = min(Decimal("0.99") / Decimal("1.10"), Decimal(str(ask[0])) + Decimal("0.05"))
-        limit = (ceiling / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-        if limit < Decimal(str(ask[0])):
-            LOG.info("SKIP %s %s: price too high for 10%% target", slug, outcome)
-            return
-        enough, minimum, shares = meets_minimum_size(data, self.amount, limit)
-        if not enough:
-            LOG.info("SKIP %s %s: $%s covers %s shares; minimum %s", slug, outcome, self.amount, shares, minimum)
-            return
+        if direct_tick is not None:
+            # Fast path: the caller already has a live Polymarket WebSocket
+            # quote. 0.99 is the binary-contract ceiling and intentionally
+            # disables the usual ask-relative slippage cap.
+            tick = Decimal(str(direct_tick))
+            if not tick.is_finite() or not 0 < tick < 1:
+                raise ValueError("invalid direct quote tick")
+            limit = (Decimal("0.99") / tick).to_integral_value(
+                rounding=ROUND_FLOOR) * tick
+        else:
+            data = self.simulator_get("book", token_id=token)
+            ask, tick = book_quote(data, time.time())
+            if not ask:
+                return
+            # Leave room for a 10% target below the $1 payout ceiling.
+            ceiling = min(Decimal("0.99") / Decimal("1.10"), Decimal(str(ask[0])) + Decimal("0.05"))
+            limit = (ceiling / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+            if limit < Decimal(str(ask[0])):
+                LOG.info("SKIP %s %s: price too high for 10%% target", slug, outcome)
+                return
+            enough, minimum, shares = meets_minimum_size(data, self.amount, limit)
+            if not enough:
+                LOG.info("SKIP %s %s: $%s covers %s shares; minimum %s", slug, outcome, self.amount, shares, minimum)
+                return
         # Check again after data fetching; never chase a market outside the opening window.
         pace_simulator()
         if not start <= time.time() < start + self.entry_window:
@@ -195,7 +207,8 @@ class OpeningBot:
         self.place_profits()
 
     def close(self):
-        self.http.close()
+        if self._owns_http:
+            self.http.close()
         self.db.close()
 
 

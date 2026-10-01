@@ -29,7 +29,7 @@ MAX_PRICE = 0.72
 BL = 0.35
 MAX_PER_WINDOW = 4.00
 WALLET_FLOOR = 1
-ASSETS = ("btc", "eth", "sol", "xrp", "doge", "bnb")
+ASSETS = ("btc", "eth", "sol", "doge", "bnb")
 
 
 def norm_cdf(x):

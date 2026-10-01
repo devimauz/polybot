@@ -41,14 +41,14 @@ class MultiBotTests(unittest.TestCase):
     def test_all_assets_share_protection_but_have_independent_markets(self):
         self.assertTrue(self.bot.cycle())
         self.assertTrue(self.bot.cycle())
-        self.assertEqual(self.bot.journal.db.execute("SELECT count(*) FROM orders").fetchone()[0], 5)
+        self.assertEqual(self.bot.journal.db.execute("SELECT count(*) FROM orders").fetchone()[0], 4)
         self.assertEqual(set(self.bot.asset_states), set(MultiBot.assets))
         self.bot.client.create_market_order.assert_not_called()
         self.bot.client.post_order.assert_not_called()
         discoveries = [c for c in self.bot.get.call_args_list if c.args[0].endswith("/markets")]
-        self.assertEqual(len(discoveries), 5)
+        self.assertEqual(len(discoveries), 4)
         quote_logs = [c for c in self.bot.log_prices.call_args_list if len(c.args) == 3]
-        self.assertEqual(len(quote_logs), 20)
+        self.assertEqual(len(quote_logs), 16)
 
     def test_confirmation_timers_survive_switching_assets(self):
         self.bot.settings = Settings(confirmation_seconds=2)
@@ -57,12 +57,12 @@ class MultiBotTests(unittest.TestCase):
         self.assertEqual(self.bot.journal.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
         with patch("bottest.time.monotonic", return_value=12):
             self.bot.cycle()
-        self.assertEqual(self.bot.journal.db.execute("SELECT count(*) FROM orders").fetchone()[0], 5)
+        self.assertEqual(self.bot.journal.db.execute("SELECT count(*) FROM orders").fetchone()[0], 4)
 
     def test_data_failure_continues_other_assets(self):
-        self.bot.step = Mock(side_effect=[httpx.ConnectError("offline")] + [None] * 4)
+        self.bot.step = Mock(side_effect=[httpx.ConnectError("offline")] + [None] * 3)
         self.assertFalse(self.bot.cycle())
-        self.assertEqual(self.bot.step.call_count, 5)
+        self.assertEqual(self.bot.step.call_count, 4)
 
     def test_cli_settings_are_shared_with_bottest(self):
         args = argument_parser().parse_args(["--max-spread", "0.02", "--confirmation-seconds", "2", "--amount", "3"])
@@ -83,7 +83,7 @@ class MultiBotTests(unittest.TestCase):
             bot = MultiBot(False)
             bot.price_log_dir = Path(directory) / "logs"
             self.assertEqual(bot.journal_path.name, "multi-bottest-dry-run.sqlite3")
-            slug = "xrp-updown-5m-1789653000"
+            slug = "eth-updown-5m-1789653000"
             bot.journal.db.execute("INSERT INTO bottest_markets(market,end,condition_id,tokens) VALUES (?,0,'c',?)",
                                    (slug, json.dumps({"Up": "up", "Down": "down"})))
             bot.journal.db.commit()
@@ -100,9 +100,9 @@ class MultiBotTests(unittest.TestCase):
                     bot.start_maintenance()
                     self.assertTrue(done.wait(3), "Background settlement did not finish")
                     bot.close()
-                rows = [json.loads(line) for line in (bot.price_log_dir / "XRP.jsonl").read_text().splitlines()]
+                rows = [json.loads(line) for line in (bot.price_log_dir / "ETH.jsonl").read_text().splitlines()]
                 self.assertEqual(len(rows), 2)
-                self.assertTrue(all(row["asset"] == "XRP" for row in rows))
+                self.assertTrue(all(row["asset"] == "ETH" for row in rows))
                 self.assertFalse((bot.price_log_dir / "SOL.jsonl").exists())
                 self.assertFalse(bot.worker.is_alive())
             finally:

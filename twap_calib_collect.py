@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 API = "https://api.polysimulator.com/v1"
 BINANCE = "https://api.binance.com"
-ASSETS = ["btc", "sol", "doge", "xrp", "eth", "bnb"]
+ASSETS = ["btc", "sol", "doge", "eth", "bnb"]
 SYMBOL = {a: a.upper() + "USDT" for a in ASSETS}
 WINDOW = 300
 T_STAR = (90.0, 150.0, 210.0)   # decision times to evaluate the model

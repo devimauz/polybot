@@ -45,7 +45,7 @@ Credentials stay in `.env` and are never displayed or served through a web page.
 
 ## Multi-asset bot
 
-`multi_bot.py` follows the current SOL, DOGE, XRP, ETH and BNB five-minute markets,
+`multi_bot.py` follows the current SOL, DOGE, ETH and BNB five-minute markets,
 automatically advancing to each new window. The timestamps in the supplied links
 identify example windows, not permanently fixed markets.
 

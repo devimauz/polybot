@@ -107,6 +107,21 @@ class PolysimulatorTests(unittest.TestCase):
         self.assertEqual(response["takingAmount"], "5.3763")
         self.assertEqual(response["orderID"], "paper-1")
 
+    def test_sell_fill_may_improve_above_limit(self):
+        body = {"market_id": "condition", "side": "SELL", "outcome": "Down",
+                "quantity": "10", "price": "0.45", "order_type": "market",
+                "time_in_force": "FOK"}
+
+        def handle(request):
+            return httpx.Response(200, json={"status": "FILLED", "price": "0.46",
+                                             "quantity": "10", "order_id": "paper-sell"})
+
+        with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+            self.bot.http = client
+            response = self.bot.post_with_retry(body, time.time() + 100)
+        self.assertEqual(response["status"], "matched")
+        self.assertEqual(response["makingAmount"], "4.60")
+
     def prepare_step(self, live):
         from decimal import Decimal
         self.bot.live = live

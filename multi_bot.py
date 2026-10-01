@@ -1,4 +1,4 @@
-"""SOL, DOGE, XRP, ETH and BNB bot with per-asset price logs in price_logs/.
+"""SOL, DOGE, ETH and BNB bot with per-asset price logs in price_logs/.
 
 For real runs, one MultiBot instance per asset runs on its own worker thread so
 the whole basket is polled at the full POLL_SECONDS cadence instead of a long
@@ -21,7 +21,7 @@ from bot import AMOUNT, Bot, D, LOG, ROOT
 
 
 class MultiBot(Bot):
-    assets = ("sol", "doge", "xrp", "eth", "bnb")
+    assets = ("sol", "doge", "eth", "bnb")
     asset = "sol"
     journal_prefix = "multi-"
 

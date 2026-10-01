@@ -83,6 +83,22 @@ class OpeningBotTests(unittest.TestCase):
             self.bot.step()
         self.assertEqual([x["side"] for x in self.orders], ["BUY", "SELL"])
 
+    def test_direct_entry_skips_book_and_uses_contract_ceiling(self):
+        get_calls = 0
+        original = self.bot.http
+
+        def direct_handler(request):
+            nonlocal get_calls
+            if request.method == "GET":
+                get_calls += 1
+            return self.handle(request)
+
+        original.close()
+        self.bot.http = httpx.Client(transport=httpx.MockTransport(direct_handler))
+        self.bot.enter(self.bot.market[0], 3300, "Up", "up", direct_tick="0.01")
+        self.assertEqual(get_calls, 0)
+        self.assertEqual(self.orders[0]["price"], "0.99")
+
 
 if __name__ == "__main__":
     unittest.main()
