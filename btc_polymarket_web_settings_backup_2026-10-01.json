@@ -1,0 +1,18 @@
+{
+  "description": "Web Polymarket strategy settings before adopting btc_price_chart.py settings",
+  "created_date": "2026-10-01",
+  "jump_threshold_usd": 15.0,
+  "trade_start_delay_seconds": 5.0,
+  "max_trades_per_window": 3,
+  "stake_usd": 1.10,
+  "take_profit_percent": 5.0,
+  "minimum_entry_price": 0.30,
+  "maximum_entry_price": 0.70,
+  "maximum_entry_slippage": 0.04,
+  "exit_mode": "aggressive FOK at minimum valid tick after TP",
+  "sell_retry_seconds": 0.02,
+  "sell_retry_window_seconds": 2.0,
+  "frame_ms": 20,
+  "signal_source": "Coinbase Exchange BTC-USD WebSocket",
+  "signal_mode": "event-driven consecutive same-direction moves"
+}

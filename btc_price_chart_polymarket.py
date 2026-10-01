@@ -1,4 +1,4 @@
-"""Standalone BTC chart and real Polymarket $1.10 jump trader.
+"""Standalone BTC chart and real Polymarket $1 jump trader.
 
 Run without --live for signal-only dry runs. Add --live to submit real orders.
 """
@@ -6,14 +6,21 @@ Run without --live for signal-only dry runs. Add --live to submit real orders.
 import argparse
 import json
 import os
+import queue
 import sqlite3
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-import tkinter as tk
-from tkinter import ttk
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:
+    # Headless terminal mode reuses this module's feeds and trading strategy.
+    tk = None
+    ttk = None
 
 import httpx
 import websocket
@@ -33,14 +40,18 @@ OKX_API = "https://www.okx.com/api/v5/market/ticker"
 BYBIT_API = "https://api.bybit.com/v5/market/tickers"
 GEMINI_API = "https://api.gemini.com/v1/pubticker/btcusd"
 WINDOW_SECONDS = 300.0
-TRADE_START_DELAY_SECONDS = 0.0
-MAX_TRADES_PER_WINDOW = 1
+TRADE_START_DELAY_SECONDS = 5.0
+TRADE_COOLDOWN_SECONDS = 0.0
+MAX_TRADES_PER_WINDOW = 3
 JUMP_TP_RATE = Decimal("0.10")
 MIN_ENTRY_PRICE = Decimal("0.30")
 MAX_ENTRY_PRICE = Decimal("0.70")
 STAKE = Decimal("1.10")
-TAKE_PROFIT = Decimal("0.10")
-ENTRY_SLIPPAGE = Decimal("0.03")
+TAKE_PROFIT = Decimal("0.05")
+ENTRY_SLIPPAGE = Decimal("0.04")
+TP_BALANCE_WAIT_SECONDS = 15.0
+SELL_RETRY_SECONDS = 0.02
+SELL_RETRY_WINDOW_SECONDS = 2.0
 TREND_SECONDS = 10.0
 TREND_MIN_MOVE = 1.0
 FRAME_MS = 20
@@ -277,6 +288,7 @@ class CoinbasePriceFeed:
         self.price = None
         self.error = "Connecting to Coinbase Exchange..."
         self.stop = threading.Event()
+        self.on_price = None
         self.thread = threading.Thread(
             target=self.run, name="coinbase-btc-feed", daemon=True)
 
@@ -286,6 +298,9 @@ class CoinbasePriceFeed:
     def snapshot(self):
         with self.lock:
             return self.price, self.error
+
+    def set_callback(self, callback):
+        self.on_price = callback
 
     def run(self):
         subscription = {"type": "subscribe", "product_ids": ["BTC-USD"],
@@ -310,6 +325,14 @@ class CoinbasePriceFeed:
                         continue
                     with self.lock:
                         self.price, self.error = price, ""
+                    callback = self.on_price
+                    if callback is not None:
+                        try:
+                            callback(price)
+                        except Exception:
+                            # A strategy callback must never disconnect the
+                            # Coinbase market-data socket.
+                            pass
             except Exception as exc:
                 with self.lock:
                     self.error = f"Coinbase Exchange {type(exc).__name__}"
@@ -322,8 +345,116 @@ class CoinbasePriceFeed:
                         pass
 
 
+class EventDrivenJumpDetector:
+    """Evaluate jump signals directly on each Coinbase WebSocket tick."""
+
+    def __init__(self, discovery, market_feed, trader, threshold, on_event=None):
+        self.discovery = discovery
+        self.market_feed = market_feed
+        self.trader = trader
+        self.threshold = threshold
+        self.on_event = on_event
+        self.lock = threading.Lock()
+        self.current_slug = None
+        self.last_price = None
+        self.last_move = None
+        self.moves = deque(maxlen=3)
+        self.history = deque(maxlen=200)
+
+    def _event(self, kind, message):
+        if self.on_event:
+            self.on_event(kind, message)
+
+    def reset(self, slug, tokens=None):
+        changed = False
+        with self.lock:
+            if slug != self.current_slug:
+                changed = True
+                self.current_slug = slug
+                self.last_price = None
+                self.last_move = None
+                self.moves.clear()
+        if changed:
+            self.trader.prepare(slug, tokens)
+
+    def snapshot(self):
+        with self.lock:
+            return self.last_price, self.last_move, list(self.moves)
+
+    def jump_history(self):
+        with self.lock:
+            return [dict(item) for item in self.history]
+
+    def on_price(self, price):
+        detected_at = time.monotonic()
+        market, _ = self.discovery.snapshot()
+        if not market:
+            return
+        slug = market[0]
+        self.reset(slug, market[2])
+        with self.lock:
+            previous = self.last_price
+            self.last_price = price
+            self.last_move = None if previous is None else price - previous
+            if self.last_move is None or self.last_move == 0:
+                return
+            market_age = time.time() - (market[1] - 300)
+            if market_age < TRADE_START_DELAY_SECONDS:
+                self.moves.clear()
+                return
+            if self.last_move is not None:
+                if self.moves and self.moves[-1] * self.last_move < 0:
+                    self.moves.clear()
+                self.moves.append(self.last_move)
+            quotes = self.market_feed.quotes()
+            up_quote, down_quote = quotes.get("Up"), quotes.get("Down")
+            jump_record = {
+                "timestamp": time.time(), "price": price,
+                "delta": self.last_move,
+                "direction": ("UP" if (self.last_move or 0) > 0 else
+                              "DOWN" if (self.last_move or 0) < 0 else "FLAT"),
+                "streak_count": len(self.moves),
+                "streak_total": float(sum(self.moves)),
+                "up_ask": None if up_quote is None else float(up_quote.ask),
+                "down_ask": None if down_quote is None else float(down_quote.ask),
+                "action": "accumulating", "request_id": None,
+            }
+            self.history.append(jump_record)
+            signal = directional_jump(self.moves, self.threshold)
+            if not signal:
+                return
+            outcome, move = signal
+            jump_record["action"] = f"{outcome} signal"
+            self._event("SIGNAL", f"{outcome} jump {move:+.2f} USD")
+            quote = quotes.get(outcome)
+            if quote is None:
+                with self.trader.lock:
+                    self.trader.status = f"skipped {outcome}: live ask unavailable"
+                self._event("SKIP", f"{outcome}: live ask unavailable")
+                jump_record["action"] = "skipped: ask unavailable"
+                self.moves.clear()
+                return
+            if not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
+                with self.trader.lock:
+                    self.trader.status = (
+                        f"skipped {outcome}: ask {quote.ask:.3f} outside entry filter")
+                self._event("SKIP", f"{outcome}: ask {quote.ask:.3f} outside "
+                            f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
+                jump_record["action"] = "skipped: entry filter"
+                self.moves.clear()
+                return
+            request_id = self.trader.submit(
+                slug, outcome, move, quote.tick, token=market[2][outcome],
+                ask=quote.ask, detected_at=detected_at)
+            if request_id:
+                jump_record["request_id"] = request_id
+                jump_record["action"] = f"{outcome} order queued"
+                self._event("ORDER", f"{outcome} queued at ask {quote.ask:.3f}")
+                self.moves.clear()
+
+
 class PolymarketJumpTrader:
-    """One real Polymarket jump trade per five-minute window with 10% TP."""
+    """One jump entry with a software-triggered 5% FOK market sell."""
 
     def __init__(self, live=False):
         self.live = live
@@ -332,18 +463,70 @@ class PolymarketJumpTrader:
             "chart-jump-polymarket-live.sqlite3" if live
             else "chart-jump-polymarket-dry-run.sqlite3")
         with sqlite3.connect(self.db_path) as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS trades (
-                market TEXT PRIMARY KEY, outcome TEXT, move REAL, token TEXT,
-                tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
-                tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+            columns = [row[1] for row in db.execute(
+                "PRAGMA table_info(trades)").fetchall()]
+            if columns and "id" not in columns:
+                db.execute("ALTER TABLE trades RENAME TO trades_single")
+                db.execute("""CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
+                    tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
+                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+                db.execute("""INSERT INTO trades
+                    (market,outcome,move,token,tick,entry_state,price,shares,
+                     tp_state,target,created,detail)
+                    SELECT market,outcome,move,token,tick,entry_state,price,
+                           shares,tp_state,target,created,detail
+                    FROM trades_single""")
+                db.execute("DROP TABLE trades_single")
+            else:
+                db.execute("""CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
+                    tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
+                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+            db.execute("CREATE INDEX IF NOT EXISTS trades_market_idx "
+                       "ON trades(market, created)")
+            columns = [row[1] for row in db.execute(
+                "PRAGMA table_info(trades)").fetchall()]
+            if "request_id" not in columns:
+                db.execute("ALTER TABLE trades ADD COLUMN request_id TEXT")
+                db.execute("UPDATE trades SET request_id='legacy-' || id "
+                           "WHERE request_id IS NULL")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_request_idx "
+                       "ON trades(request_id)")
+            db.execute("""UPDATE trades SET entry_state='rejected'
+                WHERE entry_state='unknown' AND price IS NULL
+                  AND LOWER(detail) LIKE '%fully filled or killed%'""")
         self.lock = threading.Lock()
         self.status = "ready; waiting for jump"
         self.stop = threading.Event()
         self.position_cache = (None, 0.0, None)
         self.latest_cache = (0.0, None)
+        self.open_position = None
+        self.next_sell_attempt = 0.0
+        self.window_counts = {}
+        self.pending_markets = set()
+        self.prepared_markets = set()
+        self.warming_markets = set()
+        self.warmed_markets = set()
+        self.warm_status = "not started"
+        self.last_entry_times = {}
+        self.execution_timings = deque(maxlen=200)
+        self.timing_by_request = {}
+        self.persist_queue = queue.Queue()
+        self.order_queue = queue.Queue()
+        self.persist_thread = threading.Thread(
+            target=self._persist_loop, name="polymarket-db-writer", daemon=True)
+        self.order_thread = threading.Thread(
+            target=self._order_loop, name="polymarket-order-worker", daemon=True)
         self.client = None
+        self.order_api = None
         if live:
             self._connect()
+            self._recover_position()
+        self.persist_thread.start()
+        self.order_thread.start()
 
     def _connect(self):
         response = httpx.get("https://polymarket.com/api/geoblock", timeout=8)
@@ -362,123 +545,393 @@ class PolymarketJumpTrader:
             "https://clob.polymarket.com", chain_id=137, key=key,
             signature_type=signature, funder=funder)
         self.client.set_api_creds(self.client.create_or_derive_api_key())
+        # Import and cache the signing classes before the first jump. Credential
+        # derivation above also warms the authenticated CLOB connection.
+        from py_clob_client_v2 import (MarketOrderArgs, OrderType,
+                                       PartialCreateOrderOptions, Side)
+        self.order_api = (MarketOrderArgs, OrderType,
+                          PartialCreateOrderOptions, Side)
 
     def snapshot(self):
         with self.lock:
             return self.status
 
-    def prepare(self, slug):
-        # Market tokens and live quotes already arrive through Polymarket's
-        # Gamma API and CLOB WebSocket, so there is nothing else to preload.
-        return None
+    def warmup_snapshot(self):
+        with self.lock:
+            return self.warm_status
+
+    def _recover_position(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("""SELECT * FROM trades
+                WHERE entry_state='filled' AND tp_state IN ('watching','selling')
+                ORDER BY created DESC LIMIT 1""").fetchone()
+        if not row:
+            return
+        try:
+            active = int(row["market"].rsplit("-", 1)[1]) + 300 > time.time()
+        except (ValueError, IndexError):
+            active = False
+        if active:
+            self.open_position = {
+                "id": row["request_id"], "market": row["market"],
+                "outcome": row["outcome"],
+                "token": row["token"], "tick": Decimal(row["tick"]),
+                "shares": Decimal(row["shares"]),
+                "target": Decimal(row["target"]), "selling": False,
+                "sell_deadline": None,
+            }
+            self._update(row["request_id"], tp_state="watching")
+            self.status = (f"recovered {row['outcome']}; watching bid for "
+                           f"software sell at {Decimal(row['target']):.4f}")
+
+    def prepare(self, slug, tokens=None):
+        with self.lock:
+            needs_database = slug not in self.prepared_markets
+        if needs_database:
+            with sqlite3.connect(self.db_path) as db:
+                count = db.execute("""SELECT COUNT(*) FROM trades
+                    WHERE market=? AND entry_state IN ('submitting','unknown',
+                                                        'filled','simulated')""",
+                                   (slug,)).fetchone()[0]
+                pending = db.execute("""SELECT 1 FROM trades WHERE market=?
+                    AND entry_state IN ('submitting','unknown') LIMIT 1""",
+                                     (slug,)).fetchone()
+            with self.lock:
+                self.window_counts[slug] = count
+                if pending:
+                    self.pending_markets.add(slug)
+                self.prepared_markets.add(slug)
+        if self.live and tokens:
+            with self.lock:
+                should_warm = (slug not in self.warming_markets and
+                               slug not in self.warmed_markets)
+                if should_warm:
+                    self.warming_markets.add(slug)
+                    self.warm_status = f"warming {slug} UP/DOWN metadata"
+            if should_warm:
+                threading.Thread(
+                    target=self._warm_tokens,
+                    args=(slug, tuple(str(token) for token in tokens.values())),
+                    name="polymarket-token-warmer", daemon=True).start()
+
+    def _warm_tokens(self, slug, tokens):
+        """Populate SDK caches and signing paths without posting an order."""
+        try:
+            MarketOrderArgs, OrderType, _, Side = self.order_api
+            for token in tokens:
+                self.client.create_market_order(
+                    MarketOrderArgs(token_id=token, amount=float(STAKE),
+                                    side=Side.BUY, price=0.5,
+                                    order_type=OrderType.FOK))
+            with self.lock:
+                self.warmed_markets.add(slug)
+                self.warm_status = f"{slug} UP/DOWN metadata ready"
+        except Exception as exc:
+            with self.lock:
+                self.warm_status = f"warmup {type(exc).__name__}: {str(exc)[:160]}"
+        finally:
+            with self.lock:
+                self.warming_markets.discard(slug)
 
     def trade_count(self, slug):
         with sqlite3.connect(self.db_path) as db:
-            return db.execute("SELECT COUNT(*) FROM trades WHERE market=?",
+            return db.execute("""SELECT COUNT(*) FROM trades
+                WHERE market=? AND entry_state IN ('submitting','unknown',
+                                                    'filled','simulated')""",
                               (slug,)).fetchone()[0]
 
-    def submit(self, slug, outcome, move, tick="0.01", token=None, ask=None):
+    def submit(self, slug, outcome, move, tick="0.01", token=None, ask=None,
+               detected_at=None):
         if not token or ask is None:
             with self.lock:
                 self.status = "trade skipped: missing Polymarket token/ask"
             return False
         with self.lock:
-            with sqlite3.connect(self.db_path) as db:
-                cursor = db.execute("""INSERT OR IGNORE INTO trades
-                    (market,outcome,move,token,tick,entry_state,created,detail)
-                    VALUES (?,?,?,?,?,'submitting',?,'')""",
-                    (slug, outcome, move, str(token), str(tick), time.time()))
-                if not cursor.rowcount:
-                    self.status = "one-trade limit reached for this window"
-                    return False
+            accepted = self.window_counts.get(slug, 0)
+            since_entry = time.monotonic() - self.last_entry_times.get(slug, 0.0)
+            if since_entry < TRADE_COOLDOWN_SECONDS:
+                self.status = (f"entry cooldown: "
+                               f"{TRADE_COOLDOWN_SECONDS - since_entry:.2f}s")
+                return False
+            if accepted >= MAX_TRADES_PER_WINDOW:
+                self.status = (f"{MAX_TRADES_PER_WINDOW}-trade limit "
+                               "reached for this window")
+                return False
+            if self.open_position and self.open_position["market"] == slug:
+                self.status = "waiting for open position to sell"
+                return False
+            if slug in self.pending_markets:
+                self.status = "entry already pending; duplicate blocked"
+                return False
+            request_id = uuid.uuid4().hex
+            self.pending_markets.add(slug)
+            self.last_entry_times[slug] = time.monotonic()
+            queued_at = time.monotonic()
+            timing = {
+                "request_id": request_id, "timestamp": time.time(),
+                "outcome": outcome, "move": float(move), "result": "queued",
+                "detected_to_queue_ms": None if detected_at is None else
+                    (queued_at - detected_at) * 1000,
+                "queue_wait_ms": None, "request_ms": None, "total_ms": None,
+                "_detected_at": detected_at or queued_at,
+                "_queued_at": queued_at,
+            }
+            self.execution_timings.append(timing)
+            self.timing_by_request[request_id] = timing
             self.status = f"{outcome} jump {move:+.2f}; submitting ${STAKE}"
-        threading.Thread(target=self._execute,
-                         args=(slug, outcome, str(token), str(tick), str(ask)),
-                         name="chart-polymarket-order", daemon=True).start()
-        return True
+        self.persist_queue.put(("insert", request_id, slug, outcome, move,
+                                str(token), str(tick), time.time()))
+        self.order_queue.put((request_id, slug, outcome, str(token),
+                              str(tick), str(ask)))
+        return request_id
 
-    def _update(self, slug, **fields):
-        assignments = ",".join(f"{name}=?" for name in fields)
+    def timing_history(self):
+        with self.lock:
+            result = []
+            for timing in self.execution_timings:
+                result.append({key: value for key, value in timing.items()
+                               if not key.startswith("_")})
+            return result
+
+    def _timing_update(self, request_id, result=None, response_at=None):
+        now = response_at or time.monotonic()
+        with self.lock:
+            timing = self.timing_by_request.get(request_id)
+            if not timing:
+                return
+            if result is not None:
+                timing["result"] = result
+            if response_at is not None:
+                started = timing.get("_worker_at", timing["_queued_at"])
+                timing["request_ms"] = (now - started) * 1000
+                timing["total_ms"] = (now - timing["_detected_at"]) * 1000
+
+    def _persist_loop(self):
         with sqlite3.connect(self.db_path) as db:
-            db.execute(f"UPDATE trades SET {assignments} WHERE market=?",
-                       (*fields.values(), slug))
+            while True:
+                task = self.persist_queue.get()
+                if task is None:
+                    return
+                if task[0] == "insert":
+                    _, request_id, slug, outcome, move, token, tick, created = task
+                    db.execute("""INSERT INTO trades
+                        (request_id,market,outcome,move,token,tick,entry_state,
+                         created,detail) VALUES (?,?,?,?,?,?,'submitting',?,'')""",
+                               (request_id, slug, outcome, move, token, tick, created))
+                else:
+                    _, request_id, fields = task
+                    assignments = ",".join(f"{name}=?" for name in fields)
+                    db.execute(f"UPDATE trades SET {assignments} WHERE request_id=?",
+                               (*fields.values(), request_id))
+                db.commit()
+
+    def _order_loop(self):
+        while True:
+            task = self.order_queue.get()
+            if task is None:
+                return
+            self._execute(*task)
+
+    def _update(self, request_id, **fields):
+        self.persist_queue.put(("update", request_id, fields))
         with self.lock:
             self.position_cache = (None, 0.0, None)
             self.latest_cache = (0.0, None)
 
-    def _execute(self, slug, outcome, token, tick_text, ask_text):
+    def _execute(self, request_id, slug, outcome, token, tick_text, ask_text):
+        worker_at = time.monotonic()
+        with self.lock:
+            timing = self.timing_by_request.get(request_id)
+            if timing:
+                timing["_worker_at"] = worker_at
+                timing["queue_wait_ms"] = (
+                    worker_at - timing["_queued_at"]) * 1000
+                timing["result"] = "submitting"
         tick = Decimal(tick_text)
         ask = Decimal(ask_text)
         limit = (min(Decimal("0.99"), ask + ENTRY_SLIPPAGE) /
                  tick).to_integral_value(rounding=ROUND_FLOOR) * tick
         if not self.live:
-            self._update(slug, entry_state="simulated",
+            self._update(request_id, entry_state="simulated",
                          detail=f"dry run ${STAKE}, ask {ask}, limit {limit}")
             with self.lock:
+                self.pending_markets.discard(slug)
+                self.window_counts[slug] = self.window_counts.get(slug, 0) + 1
                 self.status = (f"DRY RUN {outcome}; ${STAKE}, ask {ask}, "
                                f"limit {limit}")
+            self._timing_update(request_id, "simulated", time.monotonic())
             return
         filled = False
         try:
-            from py_clob_client_v2 import (MarketOrderArgs, OrderArgs, OrderType,
-                                           PartialCreateOrderOptions, Side)
+            MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side = self.order_api
             options = PartialCreateOrderOptions(tick_size=tick_text,
                                                 neg_risk=False)
             signed = self.client.create_market_order(
                 MarketOrderArgs(token_id=token, amount=float(STAKE),
                                 side=Side.BUY, price=float(limit),
                                 order_type=OrderType.FOK), options)
-            response = self.client.post_order(signed, OrderType.FOK)
+            response = self.client.post_order(
+                signed, OrderType.FOK, defer_exec=True)
             if (not response.get("success") or
                     str(response.get("status", "")).lower() != "matched"):
-                self._update(slug, entry_state="rejected",
+                self._update(request_id, entry_state="rejected",
                              detail=json.dumps(response)[:4000])
                 with self.lock:
+                    self.pending_markets.discard(slug)
                     self.status = f"{outcome} order rejected"
+                self._timing_update(request_id, "rejected", time.monotonic())
                 return
             paid = Decimal(str(response["makingAmount"]))
             shares = Decimal(str(response["takingAmount"]))
             price = paid / shares
             target = (price * (Decimal("1") + TAKE_PROFIT) / tick).to_integral_value(
                 rounding=ROUND_CEILING) * tick
-            self._update(slug, entry_state="filled", price=str(price),
-                         shares=str(shares), tp_state="submitting",
+            self._update(request_id, entry_state="filled", price=str(price),
+                         shares=str(shares), tp_state="watching",
                          target=str(target), detail=json.dumps(response)[:4000])
             filled = True
             with self.lock:
-                self.status = f"{outcome} filled {price:.4f}; submitting TP {target:.4f}"
+                self.open_position = {
+                    "id": request_id, "market": slug, "outcome": outcome, "token": token,
+                    "tick": tick, "shares": shares, "target": target,
+                    "selling": False, "sell_deadline": None,
+                }
+                self.pending_markets.discard(slug)
+                self.window_counts[slug] = self.window_counts.get(slug, 0) + 1
+                self.status = (f"{outcome} filled {price:.4f}; software sell "
+                               f"target {target:.4f}")
+            self._timing_update(request_id, "filled", time.monotonic())
             if target >= Decimal("1"):
-                self._update(slug, tp_state="unreachable")
+                self._update(request_id, tp_state="unreachable")
                 with self.lock:
-                    self.status = f"{outcome} filled {price:.4f}; TP unreachable"
+                    self.open_position = None
+                    self.status = f"{outcome} filled {price:.4f}; sell target unreachable"
                 return
-            tp_signed = self.client.create_order(
-                OrderArgs(token_id=token, price=float(target), size=float(shares),
-                          side=Side.SELL), options)
-            tp_response = self.client.post_order(tp_signed, OrderType.GTC)
-            tp_status = str(tp_response.get("status", "")).lower()
-            if tp_status not in ("live", "open", "matched", "pending"):
-                raise ValueError("take-profit order not confirmed")
-            self._update(slug, tp_state="submitted",
-                         detail=json.dumps(tp_response)[:4000])
-            with self.lock:
-                self.status = f"{outcome} filled {price:.4f}; TP {target:.4f} submitted"
         except Exception as exc:
             fields = {"detail": f"{type(exc).__name__}: {str(exc)[:500]}"}
             if filled:
                 fields["tp_state"] = "unknown"
+            elif "fully filled or killed" in str(exc).lower():
+                fields["entry_state"] = "rejected"
             else:
                 fields["entry_state"] = "unknown"
-            self._update(slug, **fields)
+            self._update(request_id, **fields)
+            self._timing_update(
+                request_id, "post-fill error" if filled else fields["entry_state"],
+                time.monotonic())
             with self.lock:
-                self.status = (("TP error" if filled else "order error") +
-                               f": {type(exc).__name__}; check Polymarket")
+                if filled:
+                    self.status = f"post-fill error: {type(exc).__name__}; check Polymarket"
+                elif fields["entry_state"] == "rejected":
+                    self.pending_markets.discard(slug)
+                    self.status = f"{outcome} FOK rejected; no fill"
+                else:
+                    self.status = (f"order error: {type(exc).__name__}; "
+                                   "check Polymarket")
+
+    def observe(self, slug, quotes):
+        """Watch the live bid and submit a market sell at the software target."""
+        if not self.live:
+            return
+        with self.lock:
+            position = self.open_position
+            if (not position or position["market"] != slug or
+                    position["selling"] or time.monotonic() < self.next_sell_attempt):
+                return
+            quote = quotes.get(position["outcome"])
+            if quote is None or Decimal(quote.bid) < position["target"]:
+                return
+            if position["sell_deadline"] is None:
+                position["sell_deadline"] = (
+                    time.monotonic() + SELL_RETRY_WINDOW_SECONDS)
+                timed_out = False
+            elif time.monotonic() >= position["sell_deadline"]:
+                self.open_position = None
+                self.status = "software sell stopped after 2 seconds"
+                timed_out = True
+            else:
+                timed_out = False
+            if timed_out:
+                bid = None
+            else:
+                position["selling"] = True
+                bid = Decimal(quote.bid)
+                self.status = (f"software sell triggered {position['outcome']} "
+                               f"bid {bid:.3f}")
+        if timed_out:
+            self._update(position["id"], tp_state="sell_timeout")
+            return
+        self._update(position["id"], tp_state="selling")
+        threading.Thread(target=self._sell,
+                         args=(dict(position), bid),
+                         name="chart-polymarket-sell", daemon=True).start()
+
+    def _sell(self, position, bid):
+        slug = position["market"]
+        trade_id = position["id"]
+        try:
+            from py_clob_client_v2 import (AssetType, BalanceAllowanceParams,
+                                           MarketOrderArgs, OrderType,
+                                           PartialCreateOrderOptions, Side)
+            token, shares, tick = (position["token"], position["shares"],
+                                   position["tick"])
+            balance_params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token)
+            deadline = min(time.monotonic() + TP_BALANCE_WAIT_SECONDS,
+                           position["sell_deadline"])
+            while True:
+                self.client.update_balance_allowance(balance_params)
+                balance = self.client.get_balance_allowance(balance_params)
+                indexed = (Decimal(str(balance.get("balance", "0"))) /
+                           Decimal("1000000"))
+                if indexed >= shares:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("purchased token balance not indexed for sell")
+                time.sleep(SELL_RETRY_SECONDS)
+            # Once the software TP is reached, prioritize an immediate exit.
+            # A SELL limit at the minimum valid tick may sweep every available
+            # bid; FOK still prevents a partial position from being left open.
+            limit = tick
+            options = PartialCreateOrderOptions(tick_size=str(tick),
+                                                neg_risk=False)
+            signed = self.client.create_market_order(
+                MarketOrderArgs(token_id=token, amount=float(shares),
+                                side=Side.SELL, price=float(limit),
+                                order_type=OrderType.FOK), options)
+            response = self.client.post_order(
+                signed, OrderType.FOK, defer_exec=True)
+            if (not response.get("success") or
+                    str(response.get("status", "")).lower() != "matched"):
+                raise ValueError("software sell not confirmed matched")
+            self._update(trade_id, tp_state="sold",
+                         detail=json.dumps(response)[:4000])
+            with self.lock:
+                self.open_position = None
+                self.status = (f"{position['outcome']} aggressive software "
+                               f"sell filled (floor {limit:.3f})")
+        except Exception as exc:
+            timed_out = time.monotonic() >= position["sell_deadline"]
+            self._update(trade_id,
+                         tp_state="sell_timeout" if timed_out else "watching",
+                         detail=f"{type(exc).__name__}: {str(exc)[:500]}")
+            with self.lock:
+                if timed_out:
+                    self.open_position = None
+                    self.status = "software sell stopped after 2 seconds"
+                elif self.open_position:
+                    self.open_position["selling"] = False
+                    self.next_sell_attempt = time.monotonic() + SELL_RETRY_SECONDS
+                    self.status = (f"software sell retry in 20ms: "
+                                   f"{type(exc).__name__}")
 
     def _row(self, slug=None):
         with sqlite3.connect(self.db_path) as db:
             db.row_factory = sqlite3.Row
             if slug:
-                return db.execute("SELECT * FROM trades WHERE market=?",
+                return db.execute("""SELECT * FROM trades WHERE market=?
+                    ORDER BY created DESC LIMIT 1""",
                                   (slug,)).fetchone()
             return db.execute(
                 "SELECT * FROM trades ORDER BY created DESC LIMIT 1").fetchone()
@@ -489,7 +942,12 @@ class PolymarketJumpTrader:
             cached_slug, checked, cached = self.position_cache
             if cached_slug == slug and now - checked < 0.25:
                 return cached
-        row = self._row(slug)
+        with sqlite3.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("""SELECT * FROM trades
+                WHERE market=? AND entry_state='filled'
+                  AND COALESCE(tp_state,'') != 'sold'
+                ORDER BY created DESC LIMIT 1""", (slug,)).fetchone()
         if not row or row["entry_state"] != "filled" or not row["price"]:
             position = None
         else:
@@ -520,7 +978,7 @@ class PolymarketJumpTrader:
             "move": row["move"], "entry_state": row["entry_state"],
             "price": row["price"], "shares": row["shares"],
             "target": None if row["target"] is None else float(row["target"]),
-            "tp_state": row["tp_state"],
+            "tp_state": row["tp_state"], "detail": row["detail"] or "",
         }
         with self.lock:
             self.latest_cache = (now, trade)
@@ -528,6 +986,10 @@ class PolymarketJumpTrader:
 
     def close(self):
         self.stop.set()
+        self.order_queue.put(None)
+        self.order_thread.join(timeout=5)
+        self.persist_queue.put(None)
+        self.persist_thread.join(timeout=5)
 
 
 class Discovery:
@@ -584,6 +1046,9 @@ class PriceChart:
         self.last_coinbase_move = None
         self.directional_moves = deque(maxlen=3)
         self.discovery = Discovery(self.feed)
+        self.jump_detector = EventDrivenJumpDetector(
+            self.discovery, self.feed, self.jump_trader, self.jump_threshold)
+        self.coinbase_feed.set_callback(self.jump_detector.on_price)
         self.samples, self.current_slug = deque(), None
         self.coinbase_offset = None
         style = ttk.Style()
@@ -639,53 +1104,19 @@ class PriceChart:
         quotes, now = self.feed.quotes(), time.monotonic()
         if market and market[0] != self.current_slug:
             self.current_slug = market[0]
-            self.jump_trader.prepare(market[0])
+            self.jump_trader.prepare(market[0], market[2])
             self.samples.clear()
             self.last_jump_price = None
             self.last_coinbase_move = None
             self.directional_moves.clear()
             self.coinbase_offset = None
+            self.jump_detector.reset(market[0], market[2])
         if (btc is not None and coinbase_price is not None and
                 self.coinbase_offset is None):
             self.coinbase_offset = btc - coinbase_price
-        if coinbase_price is not None and coinbase_price != self.last_jump_price:
-            previous_price = self.last_jump_price
-            self.last_coinbase_move = (None if previous_price is None else
-                                       coinbase_price - previous_price)
-            self.last_jump_price = coinbase_price
-            market_open_for = (time.time() - (market[1] - 300)) if market else 0
-            if market_open_for < TRADE_START_DELAY_SECONDS:
-                self.directional_moves.clear()
-            elif self.last_coinbase_move is not None:
-                if (self.directional_moves and
-                        self.directional_moves[-1] * self.last_coinbase_move < 0):
-                    self.directional_moves.clear()
-                self.directional_moves.append(self.last_coinbase_move)
-            signal = directional_jump(self.directional_moves,
-                                      self.jump_threshold)
-            if (signal and market and
-                    market_open_for >= TRADE_START_DELAY_SECONDS):
-                outcome, move = signal
-                quote = quotes.get(outcome)
-                if quote is None:
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"skipped {outcome}: live ask unavailable")
-                    submitted = False
-                    self.directional_moves.clear()
-                elif not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"skipped {outcome}: ask {quote.ask:.3f} outside "
-                            f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
-                    submitted = False
-                    self.directional_moves.clear()
-                else:
-                    submitted = self.jump_trader.submit(
-                        market[0], outcome, move, quote.tick,
-                        token=market[2][outcome], ask=quote.ask)
-                if submitted:
-                    self.directional_moves.clear()
+        self.last_jump_price, self.last_coinbase_move, detected_moves = (
+            self.jump_detector.snapshot())
+        self.directional_moves = deque(detected_moves, maxlen=3)
         if btc is not None:
             self.btc_card[1].configure(text=f"${btc:,.2f}")
             if price_to_beat is not None:
@@ -708,6 +1139,8 @@ class PriceChart:
                 fg=(UP_COLOR if (self.last_coinbase_move or 0) > 0 else
                     DOWN_COLOR if (self.last_coinbase_move or 0) < 0 else MUTED))
         up, down = quotes.get("Up"), quotes.get("Down")
+        if market:
+            self.jump_trader.observe(market[0], quotes)
         position = self.jump_trader.position(market[0]) if market else None
         latest_trade = self.jump_trader.latest_trade()
         if latest_trade:
@@ -715,7 +1148,7 @@ class PriceChart:
                      if latest_trade.get("price") else "")
             shares = (f" | {float(latest_trade['shares']):.3f} shares"
                       if latest_trade.get("shares") else "")
-            target = (f" | TP {latest_trade['target']:.4f} "
+            target = (f" | SELL {latest_trade['target']:.4f} "
                       f"{str(latest_trade.get('tp_state') or '').upper()}"
                       if latest_trade.get("target") is not None else "")
             jump = (f" | JUMP {float(latest_trade['move']):+.2f} USD"
@@ -825,7 +1258,7 @@ class PriceChart:
                 c.create_line(left, target_y, right, target_y,
                               fill=POSITION_COLOR, width=1, dash=(2, 5))
                 c.create_text(right - 5, target_y - 4,
-                              text=(f"TP on UP axis {position['target']:.3f}  "
+                              text=(f"SELL TARGET on UP axis {position['target']:.3f}  "
                                     f"[{position['tp_state']}]") ,
                               fill=POSITION_COLOR, anchor="se",
                               font=("Consolas", 9))
@@ -864,6 +1297,11 @@ class PriceChart:
 
 
 def main():
+    if tk is None:
+        raise RuntimeError(
+            "Tkinter is unavailable. Run btc_polymarket_headless.py for the "
+            "Rich terminal dashboard, or install your OS tkinter package."
+        )
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true",
@@ -871,7 +1309,7 @@ def main():
     args = parser.parse_args()
     root = tk.Tk()
     PriceChart(root, trader_factory=lambda: PolymarketJumpTrader(args.live))
-    root.title("BTC Live - Polymarket $1.10 Jump Trader")
+    root.title("BTC Live - Polymarket $1 Software-Exit Trader")
     root.mainloop()
 
 
