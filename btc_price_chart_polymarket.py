@@ -486,7 +486,8 @@ class PolymarketJumpTrader:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
                     tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
-                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+                    tp_state TEXT, target TEXT, tp_order_id TEXT,
+                    created REAL, detail TEXT)""")
                 db.execute("""INSERT INTO trades
                     (market,outcome,move,token,tick,entry_state,price,shares,
                      tp_state,target,created,detail)
@@ -499,7 +500,8 @@ class PolymarketJumpTrader:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
                     tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
-                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+                    tp_state TEXT, target TEXT, tp_order_id TEXT,
+                    created REAL, detail TEXT)""")
             db.execute("CREATE INDEX IF NOT EXISTS trades_market_idx "
                        "ON trades(market, created)")
             columns = [row[1] for row in db.execute(
@@ -508,6 +510,8 @@ class PolymarketJumpTrader:
                 db.execute("ALTER TABLE trades ADD COLUMN request_id TEXT")
                 db.execute("UPDATE trades SET request_id='legacy-' || id "
                            "WHERE request_id IS NULL")
+            if "tp_order_id" not in columns:
+                db.execute("ALTER TABLE trades ADD COLUMN tp_order_id TEXT")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_request_idx "
                        "ON trades(request_id)")
             db.execute("""UPDATE trades SET entry_state='rejected'
@@ -579,7 +583,8 @@ class PolymarketJumpTrader:
         with sqlite3.connect(self.db_path) as db:
             db.row_factory = sqlite3.Row
             row = db.execute("""SELECT * FROM trades
-                WHERE entry_state='filled' AND tp_state IN ('watching','selling')
+                WHERE entry_state='filled'
+                  AND tp_state IN ('watching','placing','resting','selling')
                 ORDER BY created DESC LIMIT 1""").fetchone()
         if not row:
             return
@@ -594,11 +599,17 @@ class PolymarketJumpTrader:
                 "token": row["token"], "tick": Decimal(row["tick"]),
                 "shares": Decimal(row["shares"]),
                 "target": Decimal(row["target"]), "selling": False,
-                "sell_deadline": None,
+                "sell_deadline": None, "tp_order_id": row["tp_order_id"],
+                "checking_tp": False, "next_tp_check": 0.0,
+                "tp_placing": False,
             }
-            self._update(row["request_id"], tp_state="watching")
-            self.status = (f"recovered {row['outcome']}; watching bid for "
-                           f"software sell at {Decimal(row['target']):.4f}")
+            if row["tp_order_id"]:
+                self.status = (f"recovered {row['outcome']} Polymarket TP "
+                               f"order {row['tp_order_id']}")
+            else:
+                self._update(row["request_id"], tp_state="watching")
+                self.status = (f"recovered {row['outcome']}; software TP at "
+                               f"{Decimal(row['target']):.4f}")
 
     def prepare(self, slug, tokens=None):
         with self.lock:
@@ -803,7 +814,7 @@ class PolymarketJumpTrader:
             target = (price * (Decimal("1") + TAKE_PROFIT) / tick).to_integral_value(
                 rounding=ROUND_CEILING) * tick
             self._update(request_id, entry_state="filled", price=str(price),
-                         shares=str(shares), tp_state="watching",
+                         shares=str(shares), tp_state="placing",
                          target=str(target), detail=json.dumps(response)[:4000])
             filled = True
             with self.lock:
@@ -811,11 +822,13 @@ class PolymarketJumpTrader:
                     "id": request_id, "market": slug, "outcome": outcome, "token": token,
                     "tick": tick, "shares": shares, "target": target,
                     "selling": False, "sell_deadline": None,
+                    "tp_order_id": None, "checking_tp": False,
+                    "next_tp_check": 0.0, "tp_placing": True,
                 }
                 self.pending_markets.discard(slug)
                 self.window_counts[slug] = self.window_counts.get(slug, 0) + 1
-                self.status = (f"{outcome} filled {price:.4f}; software sell "
-                               f"target {target:.4f}")
+                self.status = (f"{outcome} filled {price:.4f}; placing "
+                               f"Polymarket TP at {target:.4f}")
             self._timing_update(request_id, "filled", time.monotonic())
             if target >= Decimal("1"):
                 self._update(request_id, tp_state="unreachable")
@@ -823,6 +836,10 @@ class PolymarketJumpTrader:
                     self.open_position = None
                     self.status = f"{outcome} filled {price:.4f}; sell target unreachable"
                 return
+            threading.Thread(
+                target=self._place_exchange_tp,
+                args=(dict(self.open_position),),
+                name="polymarket-gtc-tp", daemon=True).start()
         except Exception as exc:
             fields = {"detail": f"{type(exc).__name__}: {str(exc)[:500]}"}
             if filled:
@@ -845,14 +862,125 @@ class PolymarketJumpTrader:
                     self.status = (f"order error: {type(exc).__name__}; "
                                    "check Polymarket")
 
+    def _place_exchange_tp(self, position):
+        """Place a resting Polymarket GTC sell, falling back to software TP."""
+        trade_id = position["id"]
+        try:
+            from py_clob_client_v2 import (
+                AssetType, BalanceAllowanceParams, OrderArgs, OrderType,
+                PartialCreateOrderOptions, Side)
+            token, shares, tick = (position["token"], position["shares"],
+                                   position["tick"])
+            balance_params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token)
+            deadline = time.monotonic() + TP_BALANCE_WAIT_SECONDS
+            while True:
+                self.client.update_balance_allowance(balance_params)
+                balance = self.client.get_balance_allowance(balance_params)
+                indexed = (Decimal(str(balance.get("balance", "0"))) /
+                           Decimal("1000000"))
+                if indexed >= shares:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("token balance not indexed for GTC TP")
+                time.sleep(SELL_RETRY_SECONDS)
+            options = PartialCreateOrderOptions(tick_size=str(tick), neg_risk=False)
+            signed = self.client.create_order(
+                OrderArgs(token_id=token, price=float(position["target"]),
+                          size=float(shares), side=Side.SELL), options)
+            response = self.client.post_order(
+                signed, OrderType.GTC, defer_exec=True)
+            if response.get("success") is False:
+                raise ValueError(str(response.get("error") or "GTC TP rejected"))
+            status = str(response.get("status", "")).lower()
+            order_id = (response.get("orderID") or response.get("orderId") or
+                        response.get("id"))
+            if status == "matched" and not order_id:
+                self._update(trade_id, tp_state="sold",
+                             detail=json.dumps(response)[:4000])
+                with self.lock:
+                    self.open_position = None
+                    self.status = f"{position['outcome']} Polymarket TP filled"
+                return
+            if not order_id:
+                raise ValueError("GTC TP response missing order ID")
+            self._update(trade_id, tp_state="resting", tp_order_id=str(order_id),
+                         detail=json.dumps(response)[:4000])
+            with self.lock:
+                if self.open_position and self.open_position["id"] == trade_id:
+                    self.open_position["tp_order_id"] = str(order_id)
+                    self.open_position["tp_placing"] = False
+                    self.open_position["next_tp_check"] = 0.0
+                    self.status = (f"{position['outcome']} Polymarket TP resting "
+                                   f"at {position['target']:.4f}")
+        except Exception as exc:
+            self._update(trade_id, tp_state="watching", tp_order_id=None,
+                         detail=f"GTC fallback {type(exc).__name__}: {str(exc)[:500]}")
+            with self.lock:
+                if self.open_position and self.open_position["id"] == trade_id:
+                    self.open_position["tp_order_id"] = None
+                    self.open_position["tp_placing"] = False
+                    self.status = (f"GTC TP unavailable; software TP fallback: "
+                                   f"{type(exc).__name__}")
+
+    def _check_exchange_tp(self, position):
+        trade_id, order_id = position["id"], position["tp_order_id"]
+        try:
+            order = self.client.get_order(order_id)
+            status = str(order.get("status", "")).lower()
+            matched = Decimal(str(order.get(
+                "size_matched", order.get("sizeMatched", "0")) or "0"))
+            remaining = max(Decimal("0"), position["shares"] - matched)
+            if status in ("matched", "filled") or remaining <= Decimal("0.000001"):
+                self._update(trade_id, tp_state="sold",
+                             detail=json.dumps(order)[:4000])
+                with self.lock:
+                    if self.open_position and self.open_position["id"] == trade_id:
+                        self.open_position = None
+                        self.status = f"{position['outcome']} Polymarket TP filled"
+                return
+            if status in ("canceled", "cancelled", "expired", "failed"):
+                self._update(trade_id, tp_state="watching", tp_order_id=None,
+                             shares=str(remaining), detail=json.dumps(order)[:4000])
+                with self.lock:
+                    if self.open_position and self.open_position["id"] == trade_id:
+                        self.open_position["shares"] = remaining
+                        self.open_position["tp_order_id"] = None
+                        self.open_position["checking_tp"] = False
+                        self.status = "Polymarket TP ended; software TP fallback active"
+                return
+            with self.lock:
+                if self.open_position and self.open_position["id"] == trade_id:
+                    self.open_position["checking_tp"] = False
+                    self.open_position["next_tp_check"] = time.monotonic() + 0.25
+                    self.status = (f"Polymarket TP resting; matched "
+                                   f"{matched:.4f}/{position['shares']:.4f}")
+        except Exception as exc:
+            with self.lock:
+                if self.open_position and self.open_position["id"] == trade_id:
+                    self.open_position["checking_tp"] = False
+                    self.open_position["next_tp_check"] = time.monotonic() + 0.5
+                    self.status = f"TP status retry: {type(exc).__name__}"
+
     def observe(self, slug, quotes):
-        """Watch the live bid and submit a market sell at the software target."""
+        """Monitor exchange-side TP, with aggressive software fallback."""
         if not self.live:
             return
         with self.lock:
             position = self.open_position
             if (not position or position["market"] != slug or
                     position["selling"] or time.monotonic() < self.next_sell_attempt):
+                return
+            if position.get("tp_order_id"):
+                if (not position.get("checking_tp") and
+                        time.monotonic() >= position.get("next_tp_check", 0)):
+                    position["checking_tp"] = True
+                    threading.Thread(
+                        target=self._check_exchange_tp,
+                        args=(dict(position),), name="polymarket-tp-status",
+                        daemon=True).start()
+                return
+            if position.get("tp_placing"):
                 return
             quote = quotes.get(position["outcome"])
             if quote is None or Decimal(quote.bid) < position["target"]:

@@ -164,7 +164,7 @@ class WebTradingEngine:
                     "entry_min": float(MIN_ENTRY_PRICE), "entry_max": float(MAX_ENTRY_PRICE),
                     "config": {"stake": float(STAKE), "take_profit_pct": float(TAKE_PROFIT * 100),
                                "entry_slippage": float(ENTRY_SLIPPAGE),
-                               "exit_mode": "aggressive FOK at minimum tick",
+                               "exit_mode": "Polymarket GTC TP + aggressive FOK fallback",
                                "sell_retry_ms": int(SELL_RETRY_SECONDS * 1000),
                                "sell_window_seconds": float(SELL_RETRY_WINDOW_SECONDS),
                                "trade_start_delay_seconds": float(TRADE_START_DELAY_SECONDS),
@@ -214,9 +214,9 @@ HTML = r'''<!doctype html>
  <section class="card third"><h2>Signal</h2><div class="rows"><div>Trend</div><div id="trend">--</div><div>Sequence</div><div id="sequence">--</div><div>Threshold</div><div id="threshold">--</div><div>Noise filter</div><div id="noiseFilter">--</div><div>Entry filter</div><div id="filter">--</div></div></section>
  <section class="card third"><h2>Market</h2><div class="rows"><div>Slug</div><div id="market">--</div><div>Elapsed</div><div id="elapsed">--</div><div>Synced price</div><div id="synced">--</div><div>Offset</div><div id="offset">--</div><div>Trades this window</div><div id="tradeCount">--</div><div>Order warmup</div><div id="warmup">--</div></div></section>
  <section class="card half"><h2>Trader status</h2><div class="status" id="status">Starting…</div></section>
- <section class="card half"><h2>Position / software sell</h2><div class="status" id="trade">No trade in this process.</div></section>
+ <section class="card half"><h2>Position / hybrid TP</h2><div class="status" id="trade">No trade in this process.</div></section>
  <section class="card" style="grid-column:span 12"><h2>Feed status</h2><div id="errors" class="status up">Connecting…</div></section>
- <section class="card half"><h2>Strategy configuration</h2><div class="rows"><div>Stake</div><div id="cfgStake">--</div><div>Software TP</div><div id="cfgTp">--</div><div>Entry slippage</div><div id="cfgEntrySlip">--</div><div>Exit mode</div><div id="cfgExitMode">--</div><div>Sell retry</div><div id="cfgRetry">--</div><div>Sell retry window</div><div id="cfgWindow">--</div></div></section>
+ <section class="card half"><h2>Strategy configuration</h2><div class="rows"><div>Stake</div><div id="cfgStake">--</div><div>TP target</div><div id="cfgTp">--</div><div>Entry slippage</div><div id="cfgEntrySlip">--</div><div>Exit mode</div><div id="cfgExitMode">--</div><div>Sell retry</div><div id="cfgRetry">--</div><div>Sell retry window</div><div id="cfgWindow">--</div></div></section>
  <section class="card half"><h2>Open position details</h2><div class="rows"><div>Outcome</div><div id="posOutcome">--</div><div>Entry on UP axis</div><div id="posEntry">--</div><div>5% TP on UP axis</div><div id="posTarget">--</div><div>Shares</div><div id="posShares">--</div><div>Sell state</div><div id="posState">--</div></div></section>
  <section class="card" style="grid-column:span 12"><h2>Jump history - latest 200 Coinbase moves</h2><div class="events"><table><thead><tr><th>Time</th><th>Direction</th><th>BTC</th><th>Move</th><th>Streak</th><th>Total</th><th>UP ask</th><th>DOWN ask</th><th>Action</th></tr></thead><tbody id="jumpRows"></tbody></table></div></section>
  <section class="card" style="grid-column:span 12"><h2>Order execution timing</h2><div class="events"><table><thead><tr><th>Time</th><th>Outcome</th><th>Jump</th><th>Detect to queue</th><th>Queue wait</th><th>Sign + match response</th><th>Total</th><th>Result</th></tr></thead><tbody id="timingRows"></tbody></table></div></section>
