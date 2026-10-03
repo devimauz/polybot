@@ -663,6 +663,37 @@ class JumpPaperTrader:
         self.http.close()
 
 
+class DisplayOnlyTrader:
+    """No-op trader used when the chart must never submit simulator orders."""
+
+    venue_name = "TRADING DISABLED"
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "display only; PolySimulator trading is disabled"
+
+    def snapshot(self):
+        with self.lock:
+            return self.status
+
+    def prepare(self, slug):
+        return None
+
+    def submit(self, slug, outcome, move, tick="0.01", token=None):
+        with self.lock:
+            self.status = "signal observed; trading is disabled"
+        return False
+
+    def position(self, slug):
+        return None
+
+    def latest_trade(self):
+        return None
+
+    def close(self):
+        return None
+
+
 class Discovery:
     def __init__(self, feed):
         self.feed = feed
@@ -701,7 +732,7 @@ class Discovery:
 
 
 class PriceChart:
-    def __init__(self, root, trader_factory=JumpPaperTrader):
+    def __init__(self, root, trader_factory=DisplayOnlyTrader):
         self.root = root
         root.title("BTC + Polymarket Confirmation Trend - PolySimulator")
         root.geometry("1450x820")

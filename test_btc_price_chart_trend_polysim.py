@@ -5,7 +5,8 @@ from decimal import Decimal
 from pathlib import Path
 
 from btc_price_chart_trend_polysim import (
-    JUMP_STAKE, MAX_ENTRY_PRICE, MIN_ENTRY_PRICE, JumpPaperTrader,
+    JUMP_STAKE, MAX_ENTRY_PRICE, MIN_ENTRY_PRICE, DisplayOnlyTrader,
+    JumpPaperTrader,
     TAKE_PROFIT_RATE, TRADE_COOLDOWN_SECONDS,
     crossed_above, largest_depth_level, resting_pressure_crossing,
 )
@@ -32,6 +33,13 @@ class RestingBidPressureStrategyTests(unittest.TestCase):
 
     def test_polysimulator_take_profit_is_ten_percent(self):
         self.assertEqual(TAKE_PROFIT_RATE, Decimal("0.10"))
+
+    def test_display_only_trader_never_submits(self):
+        trader = DisplayOnlyTrader()
+        self.assertFalse(trader.submit("window", "Up", 81.0))
+        self.assertIsNone(trader.position("window"))
+        self.assertIsNone(trader.latest_trade())
+        self.assertIn("disabled", trader.snapshot())
 
     def test_entry_unlocks_after_polysimulator_accepts_tp(self):
         with tempfile.TemporaryDirectory() as folder:
