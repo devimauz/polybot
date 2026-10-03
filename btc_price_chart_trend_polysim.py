@@ -1,13 +1,12 @@
 """Live Polymarket BTC price, price-to-beat, and 5-minute Up graph."""
 
 import json
-import os
 import sqlite3
 import threading
 import time
 from collections import deque
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 import tkinter as tk
 from tkinter import ttk
 
@@ -33,11 +32,16 @@ GEMINI_API = "https://api.gemini.com/v1/pubticker/btcusd"
 # this only controls how much data the chart retains and draws.
 WINDOW_SECONDS = 60.0
 TRADE_START_DELAY_SECONDS = 0.0
-TRADE_COOLDOWN_SECONDS = 1.0
-JUMP_TP_RATE = Decimal("0.10")
+TRADE_COOLDOWN_SECONDS = 5.0
 JUMP_STAKE = Decimal("100")
-MIN_ENTRY_PRICE = Decimal("0.20")
-MAX_ENTRY_PRICE = Decimal("0.80")
+RESTING_BID_PRESSURE_THRESHOLD = 0.80
+RESTING_BID_PRESSURE_EXIT = 0.70
+SELL_RETRY_ATTEMPTS = 5
+SELL_RETRY_SECONDS = 0.5
+SELL_SLIPPAGE = Decimal("0.05")
+MIN_ENTRY_PRICE = Decimal("0.30")
+MAX_ENTRY_PRICE = Decimal("0.70")
+MAX_ORDER_LIMIT = Decimal("0.99")
 TREND_SECONDS = 10.0
 TREND_MIN_MOVE = 1.0
 TREND_ENTRY_THRESHOLD = 40.0
@@ -94,6 +98,30 @@ def position_on_up_axis(outcome, price):
     """Project either contract's price onto the Polymarket UP axis."""
     price = float(price)
     return price if outcome == "Up" else 1.0 - price
+
+
+def crossed_above(previous, current, threshold):
+    """Return true only for a fresh upward crossing of a threshold."""
+    return previous is not None and previous <= threshold < current
+
+
+def resting_pressure_crossing(previous_up, current_up,
+                              threshold=RESTING_BID_PRESSURE_THRESHOLD):
+    """Return the outcome and pressure for a fresh 80% bid-pressure crossing."""
+    if crossed_above(previous_up, current_up, threshold):
+        return "Up", current_up
+    previous_down = None if previous_up is None else 1.0 - previous_up
+    current_down = 1.0 - current_up
+    if crossed_above(previous_down, current_down, threshold):
+        return "Down", current_down
+    return None
+
+
+def should_exit_pressure(outcome, up_pressure,
+                         threshold=RESTING_BID_PRESSURE_EXIT):
+    """Return true once the held outcome's resting bid pressure is 70% or less."""
+    side_pressure = up_pressure if outcome == "Up" else 1.0 - up_pressure
+    return side_pressure <= threshold
 
 
 def price_trend(points, min_move=TREND_MIN_MOVE):
@@ -383,7 +411,7 @@ class CoinbasePriceFeed:
 
 
 class JumpPaperTrader:
-    """PolySimulator trend entries, each with a 10% take-profit."""
+    """PolySimulator pressure entries with retrying software pressure exits."""
 
     venue_name = "POLYSIM"
 
@@ -392,8 +420,7 @@ class JumpPaperTrader:
         self.http = httpx.Client(timeout=10)
         setup = OpeningBot(
             asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
-            db_path=self.db_path, http_client=self.http,
-            take_profit=JUMP_TP_RATE)
+            db_path=self.db_path, http_client=self.http)
         setup.close()
         with sqlite3.connect(self.db_path) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS jump_signals (
@@ -408,13 +435,10 @@ class JumpPaperTrader:
         self.inflight = set()
         self.preparing = set()
         self.prepared = {}
-        self.status = "trend trader ready; waiting for confirmed BTC/UP trend"
+        self.status = "waiting for 80% entry pressure; software exit at 70%"
         self.position_cache = (None, 0.0, None)
         self.latest_cache = (0.0, None)
         self.stop = threading.Event()
-        self.maintenance = threading.Thread(
-            target=self._maintain, name="chart-jump-tp", daemon=True)
-        self.maintenance.start()
 
     def snapshot(self):
         with self.lock:
@@ -431,19 +455,18 @@ class JumpPaperTrader:
             db.row_factory = sqlite3.Row
             row = db.execute("""SELECT outcome,price,shares,tick,tp_state
                 FROM trades WHERE market LIKE ? AND entry_state='filled'
+                  AND COALESCE(tp_state,'') != 'sold'
                 ORDER BY rowid DESC LIMIT 1""", (slug + "#jump-%",)).fetchone()
         position = None
         if row and row["price"]:
             price = Decimal(row["price"])
             tick = Decimal(row["tick"])
-            target = (price * (Decimal("1") + JUMP_TP_RATE) / tick).to_integral_value(
-                rounding="ROUND_CEILING") * tick
             position = {
                 "outcome": row["outcome"],
                 "shares": float(row["shares"] or 0),
                 "entry": position_on_up_axis(row["outcome"], price),
-                "target": position_on_up_axis(row["outcome"], target),
-                "tp_state": row["tp_state"] or "needed",
+                "target": None,
+                "tp_state": row["tp_state"] or "watching",
             }
         with self.lock:
             self.position_cache = (slug, now, position)
@@ -466,11 +489,7 @@ class JumpPaperTrader:
         trade = None
         if row:
             trade = dict(row)
-            if row["price"] and row["tick"]:
-                price, tick = Decimal(row["price"]), Decimal(row["tick"])
-                trade["target"] = float(
-                    (price * (Decimal("1") + JUMP_TP_RATE) / tick).to_integral_value(
-                        rounding="ROUND_CEILING") * tick)
+            trade["target"] = None
         with self.lock:
             self.latest_cache = (now, trade)
         return trade
@@ -480,6 +499,19 @@ class JumpPaperTrader:
             return db.execute("""SELECT COALESCE(MAX(slot),0),
                 COALESCE(MAX(created),0) FROM jump_entries WHERE market=?""",
                               (slug,)).fetchone()
+
+    def has_open_trade(self, slug):
+        """Return whether this market has an entry or position not yet sold."""
+        db = sqlite3.connect(self.db_path)
+        try:
+            row = db.execute("""SELECT 1 FROM trades
+                WHERE market LIKE ?
+                  AND entry_state IN ('reserved','filled','retry')
+                  AND COALESCE(tp_state,'') != 'sold'
+                LIMIT 1""", (slug + "#jump-%",)).fetchone()
+            return row is not None
+        finally:
+            db.close()
 
     def prepare(self, slug):
         """Warm the connection and cache simulator market metadata before signals."""
@@ -496,7 +528,7 @@ class JumpPaperTrader:
             bot = OpeningBot(
                 asset="btc", amount=JUMP_STAKE, paper=True,
                 entry_window=300, db_path=self.db_path,
-                http_client=self.http, take_profit=JUMP_TP_RATE)
+                http_client=self.http)
             for _ in range(10):
                 if self.stop.is_set():
                     return
@@ -519,6 +551,9 @@ class JumpPaperTrader:
 
     def submit(self, slug, outcome, move, tick="0.01", token=None):
         with self.lock:
+            if self.inflight or self.has_open_trade(slug):
+                self.status = "entry skipped: one trade is already open"
+                return False
             last_slot, last_created = self.trade_window_state(slug)
             elapsed = time.time() - last_created
             if last_created and elapsed < TRADE_COOLDOWN_SECONDS:
@@ -547,8 +582,7 @@ class JumpPaperTrader:
         try:
             bot = OpeningBot(
                 asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
-                db_path=self.db_path, http_client=self.http,
-                take_profit=JUMP_TP_RATE)
+                db_path=self.db_path, http_client=self.http)
             with self.lock:
                 cached = self.prepared.get(expected_slug)
             if cached:
@@ -560,26 +594,21 @@ class JumpPaperTrader:
                 raise ValueError("simulator market unavailable")
             slug, end, tokens = market
             bot.enter(trade_key, end, outcome, tokens[outcome], direct_tick=tick,
-                      direct_limit=MAX_ENTRY_PRICE)
+                      direct_limit=MAX_ORDER_LIMIT)
             row = bot.db.execute(
                 "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
                 (trade_key, outcome)).fetchone()
+            if row and row["entry_state"] == "filled":
+                bot.update(trade_key, outcome, tp_state="watching")
+                row = bot.db.execute(
+                    "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
+                    (trade_key, outcome)).fetchone()
             with self.lock:
                 self.status = (f"{outcome} " +
-                               (f"{row['entry_state']}; TP {row['tp_state']}"
+                               (f"{row['entry_state']}; exit {row['tp_state']}"
                                 if row else "entry skipped"))
                 self.position_cache = (None, 0.0, None)
                 self.latest_cache = (0.0, None)
-            bot.place_profits()
-            row = bot.db.execute(
-                "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
-                (trade_key, outcome)).fetchone()
-            if row:
-                with self.lock:
-                    self.status = (f"{outcome} {row['entry_state']}; "
-                                   f"TP {row['tp_state']}")
-                    self.position_cache = (None, 0.0, None)
-                    self.latest_cache = (0.0, None)
         except Exception as exc:
             with self.lock:
                 self.status = f"jump trade error: {type(exc).__name__}"
@@ -589,21 +618,83 @@ class JumpPaperTrader:
             with self.lock:
                 self.inflight.discard(trade_key)
 
-    def _maintain(self):
-        while not self.stop.wait(5):
-            bot = None
-            try:
-                bot = OpeningBot(
-                    asset="btc", amount=JUMP_STAKE, paper=True,
-                    entry_window=300, db_path=self.db_path,
-                    http_client=self.http, take_profit=JUMP_TP_RATE)
-                bot.place_profits()
-            except Exception as exc:
+    def exit_on_pressure(self, slug, up_pressure, quotes):
+        """Start software exits when the held side's bid pressure reaches 70%."""
+        if up_pressure is None:
+            return
+        pressures = {"Up": up_pressure, "Down": 1.0 - up_pressure}
+        with sqlite3.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""SELECT rowid,* FROM trades
+                WHERE market LIKE ? AND entry_state='filled'
+                  AND tp_state IN ('watching','sell_retry')""",
+                              (slug + "#jump-%",)).fetchall()
+        for row in rows:
+            outcome = row["outcome"]
+            quote = quotes.get(outcome)
+            if (not should_exit_pressure(outcome, up_pressure)
+                    or quote is None or row["market"] in self.inflight):
+                continue
+            with self.lock:
+                if row["market"] in self.inflight:
+                    continue
+                self.inflight.add(row["market"])
+            threading.Thread(
+                target=self._sell_with_retries,
+                args=(dict(row), quote.bid, quote.tick, pressures[outcome]),
+                name="chart-pressure-sell", daemon=True).start()
+
+    def _sell_with_retries(self, position, bid, tick, pressure):
+        trade_key, outcome = position["market"], position["outcome"]
+        bot = None
+        try:
+            bot = OpeningBot(
+                asset="btc", amount=JUMP_STAKE, paper=True,
+                entry_window=300, db_path=self.db_path,
+                http_client=self.http)
+            bot.update(trade_key, outcome, tp_state="selling")
+            tick = Decimal(str(tick))
+            limit = max(tick, Decimal(str(bid)) - SELL_SLIPPAGE)
+            limit = (limit / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+            last_error = "sell not filled"
+            for attempt in range(1, SELL_RETRY_ATTEMPTS + 1):
+                if self.stop.is_set() or time.time() >= float(position["end"]):
+                    break
+                try:
+                    payload = bot.post({
+                        "market_id": position["cid"], "side": "SELL",
+                        "outcome": outcome, "quantity": position["shares"],
+                        "price": str(limit), "order_type": "market",
+                        "time_in_force": "FOK",
+                    })
+                    status = str(payload.get("status", "")).lower()
+                    if status in ("filled", "matched"):
+                        bot.update(trade_key, outcome, tp_state="sold",
+                                   detail=json.dumps(payload))
+                        with self.lock:
+                            self.status = (f"{outcome} software sell filled on "
+                                           f"attempt {attempt} at {pressure:.1%} pressure")
+                        return
+                    last_error = json.dumps(payload)[:1000]
+                except Exception as exc:
+                    last_error = bot.error_detail(exc)
                 with self.lock:
-                    self.status = f"TP maintenance error: {type(exc).__name__}"
-            finally:
-                if bot is not None:
-                    bot.close()
+                    self.status = (f"{outcome} software sell attempt {attempt}/"
+                                   f"{SELL_RETRY_ATTEMPTS} failed; retrying")
+                if attempt < SELL_RETRY_ATTEMPTS:
+                    self.stop.wait(SELL_RETRY_SECONDS)
+            bot.update(trade_key, outcome, tp_state="sell_retry",
+                       detail=last_error)
+            with self.lock:
+                self.status = (f"{outcome} software sell still pending; "
+                               "will retry while pressure is at/below 70%")
+        finally:
+            if bot is not None:
+                bot.close()
+            with self.lock:
+                self.inflight.discard(trade_key)
+                self.position_cache = (None, 0.0, None)
+                self.latest_cache = (0.0, None)
 
     def close(self):
         self.stop.set()
@@ -664,6 +755,8 @@ class PriceChart:
         self.btc_trend_ticks = deque()
         self.up_trend_ticks = deque()
         self.bid_pressure_samples = deque()
+        self.up_bid_pressure = None
+        self.pressure_crossing = None
         self.discovery = Discovery(self.feed)
         self.samples, self.current_slug = deque(), None
         self.coinbase_offset = None
@@ -683,7 +776,9 @@ class PriceChart:
         self.coinbase_card = self.card(
             cards, "COINBASE EXCHANGE BTC-USD", COINBASE_COLOR)
         self.up_card = self.card(cards, "POLYMARKET UP", UP_COLOR)
-        all_cards = (self.btc_card, self.coinbase_card, self.up_card)
+        self.down_card = self.card(cards, "POLYMARKET DOWN", DOWN_COLOR)
+        all_cards = (self.btc_card, self.coinbase_card,
+                     self.up_card, self.down_card)
         for index, card in enumerate(all_cards):
             card[0].pack(side="left", fill="x", expand=True,
                          padx=(0 if index == 0 else 3,
@@ -792,6 +887,12 @@ class PriceChart:
         bid_total = totals["Up"]["bid"] + totals["Down"]["bid"]
         up_depth_pct = (50.0 if not bid_total else
                         totals["Up"]["bid"] / bid_total * 100)
+        previous_pressure = self.up_bid_pressure
+        self.up_bid_pressure = up_depth_pct / 100.0
+        crossing = resting_pressure_crossing(
+            previous_pressure, self.up_bid_pressure)
+        if crossing is not None:
+            self.pressure_crossing = crossing
         self.bid_pressure_samples.append((now, up_depth_pct / 100.0))
         while (self.bid_pressure_samples and
                self.bid_pressure_samples[0][0] < now - WINDOW_SECONDS):
@@ -870,7 +971,13 @@ class PriceChart:
             self.btc_trend_ticks.clear()
             self.up_trend_ticks.clear()
             self.bid_pressure_samples.clear()
+            self.up_bid_pressure = None
+            self.pressure_crossing = None
             self.coinbase_offset = None
+        self._update_market_activity(now)
+        if market:
+            self.jump_trader.exit_on_pressure(
+                market[0], self.up_bid_pressure, quotes)
         if (btc is not None and coinbase_price is not None and
                 self.coinbase_offset is None):
             self.coinbase_offset = btc - coinbase_price
@@ -892,60 +999,36 @@ class PriceChart:
             while (self.btc_trend_ticks and
                    self.btc_trend_ticks[0][0] < now - TREND_SECONDS):
                 self.btc_trend_ticks.popleft()
-            market_open_for = (time.time() - (market[1] - 300)) if market else 0
-            if market_open_for < TRADE_START_DELAY_SECONDS:
-                self.directional_moves.clear()
-            slow = price_trend(list(self.btc_trend_ticks), min_move=0)
-            slow_move = slow[1] if slow else 0.0
-            raw_zone = ("Up" if slow_move >= TREND_ENTRY_THRESHOLD else
-                        "Down" if slow_move <= -TREND_ENTRY_THRESHOLD else None)
-            if raw_zone is None:
-                self.trend_signal_zone = None
-            confirmation, reason = confirmed_trend_signal(
-                list(self.btc_trend_ticks), list(self.up_trend_ticks),
-                price_to_beat, now)
-            signal = (confirmation is not None and
-                      confirmation["outcome"] != self.trend_signal_zone)
-            if (signal and market and
-                    market_open_for >= TRADE_START_DELAY_SECONDS):
-                outcome = confirmation["outcome"]
-                move = confirmation["move"]
-                quote = quotes.get(outcome)
-                if quote is None:
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"skipped {outcome}: live ask unavailable")
-                    submitted = False
-                    self.directional_moves.clear()
-                elif quote.ask - quote.bid > MAX_ENTRY_SPREAD:
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"skipped {outcome}: spread "
-                            f"{quote.ask - quote.bid:.3f} > {MAX_ENTRY_SPREAD}")
-                    submitted = False
-                elif not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"skipped {outcome}: ask {quote.ask:.3f} outside "
-                            f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
-                    submitted = False
-                    self.directional_moves.clear()
-                else:
-                    submitted = self.jump_trader.submit(
-                        market[0], outcome, move, quote.tick,
-                        token=market[2][outcome])
-                if submitted:
-                    self.trend_signal_zone = outcome
-                    with self.jump_trader.lock:
-                        self.jump_trader.status = (
-                            f"{outcome} confirmed: slow {move:+.2f}, fast "
-                            f"{confirmation['fast_move']:+.2f}, UP contract "
-                            f"{confirmation['up_move']:+.3f}, ticks "
-                            f"{confirmation['directional_ratio']:.0%}; "
-                            "order submitted")
-            elif raw_zone is not None and confirmation is None:
+        crossing = self.pressure_crossing
+        if crossing is not None:
+            self.pressure_crossing = None
+            outcome, pressure = crossing
+            quote = quotes.get(outcome)
+            if not market:
                 with self.jump_trader.lock:
-                    self.jump_trader.status = f"trend filtered: {reason}"
+                    self.jump_trader.status = "80% pressure crossing skipped: no market"
+            elif quote is None:
+                with self.jump_trader.lock:
+                    self.jump_trader.status = (
+                        f"80% pressure crossing skipped: {outcome.upper()} ask unavailable")
+            elif quote.ask - quote.bid > MAX_ENTRY_SPREAD:
+                with self.jump_trader.lock:
+                    self.jump_trader.status = (
+                        f"80% pressure crossing skipped: spread "
+                        f"{quote.ask - quote.bid:.3f} > {MAX_ENTRY_SPREAD}")
+            elif not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
+                with self.jump_trader.lock:
+                    self.jump_trader.status = (
+                        f"80% pressure crossing skipped: ask {quote.ask:.3f} outside "
+                        f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
+            elif self.jump_trader.submit(
+                    market[0], outcome, pressure * 100.0, quote.tick,
+                    token=market[2][outcome]):
+                with self.jump_trader.lock:
+                    self.jump_trader.status = (
+                        f"{outcome.upper()} resting bid pressure crossed 80% "
+                        f"to {pressure:.1%}; "
+                        "order submitted; software exit at 70% pressure")
         if btc is not None:
             self.btc_card[1].configure(text=f"${btc:,.2f}")
             if price_to_beat is not None:
@@ -975,10 +1058,9 @@ class PriceChart:
                      if latest_trade.get("price") else "")
             shares = (f" | {float(latest_trade['shares']):.3f} shares"
                       if latest_trade.get("shares") else "")
-            target = (f" | TP {latest_trade['target']:.4f} "
-                      f"{str(latest_trade.get('tp_state') or '').upper()}"
-                      if latest_trade.get("target") is not None else "")
-            jump = (f" | TREND {float(latest_trade['move']):+.2f} USD"
+            target = (f" | EXIT {str(latest_trade.get('tp_state') or '').upper()}"
+                      if latest_trade.get("entry_state") == "filled" else "")
+            jump = (f" | BID PRESSURE {float(latest_trade['move']):.1f}%"
                     if latest_trade.get("move") is not None else "")
             state = str(latest_trade.get("entry_state") or "signal").upper()
             self.trade_banner.configure(
@@ -992,6 +1074,14 @@ class PriceChart:
                 f"   POS {position['outcome']} @ UP {position['entry']:.3f}")
             self.up_card[2].configure(
                 text=f"bid {up.bid:.3f}   ask {up.ask:.3f}{position_text}")
+        if down:
+            self.down_card[1].configure(
+                text=f"{down.probability:.3f}", fg=DOWN_COLOR)
+            position_text = ("" if not position else
+                f"   POS {position['outcome']} @ DOWN "
+                f"{1.0 - position['entry']:.3f}")
+            self.down_card[2].configure(
+                text=f"bid {down.bid:.3f}   ask {down.ask:.3f}{position_text}")
         if btc is not None or coinbase_price is not None or up or down:
             synced_coinbase = (
                 None if coinbase_price is None or self.coinbase_offset is None
@@ -1016,7 +1106,6 @@ class PriceChart:
                                   foreground=UP_COLOR if up and down else MUTED)
         else:
             self.status.configure(text=errors or "Waiting for live data...", foreground=MUTED)
-        self._update_market_activity(now)
         self.draw(now, price_to_beat, position)
         self.root.after(FRAME_MS, self.tick)
 
@@ -1047,7 +1136,9 @@ class PriceChart:
                       fill=COINBASE_COLOR, anchor="w")
         c.create_text(left + 155, 18, text="Polymarket Up",
                       fill=UP_COLOR, anchor="w")
-        c.create_text(left + 270, 18, text="UP bid pressure",
+        c.create_text(left + 270, 18, text="Polymarket Down",
+                      fill=DOWN_COLOR, anchor="w")
+        c.create_text(left + 410, 18, text="UP bid pressure",
                       fill=BTC_COLOR, anchor="w")
         trend_points = [
             (stamp, coinbase_price)
@@ -1059,7 +1150,7 @@ class PriceChart:
             trend_color = (UP_COLOR if direction == "UP" else
                            DOWN_COLOR if direction == "DOWN" else MUTED)
             arrow = "↑" if direction == "UP" else "↓" if direction == "DOWN" else "→"
-            c.create_text(left + 400, 18,
+            c.create_text(left + 530, 18,
                           text=f"{arrow} {direction} {move:+.2f} / {TREND_SECONDS:.0f}s",
                           fill=trend_color, anchor="w",
                           font=("Consolas", 10, "bold"))
@@ -1075,7 +1166,6 @@ class PriceChart:
                           anchor="se", font=("Consolas", 9, "bold"))
         if position:
             entry_y = bottom - position["entry"] * (bottom - top)
-            target_y = bottom - position["target"] * (bottom - top)
             c.create_line(left, entry_y, right, entry_y,
                           fill=POSITION_COLOR, width=2, dash=(8, 4))
             c.create_text(left + 6, entry_y - 5,
@@ -1084,18 +1174,15 @@ class PriceChart:
                                 f"{position['shares']:.2f} shares"),
                           fill=POSITION_COLOR, anchor="sw",
                           font=("Consolas", 9, "bold"))
-            if 0 <= position["target"] <= 1:
-                c.create_line(left, target_y, right, target_y,
-                              fill=POSITION_COLOR, width=1, dash=(2, 5))
-                c.create_text(right - 5, target_y - 4,
-                              text=(f"TP on UP axis {position['target']:.3f}  "
-                                    f"[{position['tp_state']}]") ,
-                              fill=POSITION_COLOR, anchor="se",
-                              font=("Consolas", 9))
+            c.create_text(right - 5, entry_y - 4,
+                          text=(f"SOFTWARE EXIT AT 70% BID PRESSURE "
+                                f"[{position['tp_state']}]") ,
+                          fill=POSITION_COLOR, anchor="se",
+                          font=("Consolas", 9))
         if len(self.samples) < 2:
             return
         start = now - WINDOW_SECONDS
-        points = {"coinbase": [], "up": []}
+        points = {"coinbase": [], "up": [], "down": []}
         for stamp, coinbase_price, up, down in self.samples:
             x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
             if coinbase_price is not None:
@@ -1103,7 +1190,10 @@ class PriceChart:
                     x, bottom - (coinbase_price-low)/(high-low)*(bottom-top)]
             if up is not None:
                 points["up"] += [x, bottom - up * (bottom-top)]
-        for name, color in (("coinbase", COINBASE_COLOR), ("up", UP_COLOR)):
+            if down is not None:
+                points["down"] += [x, bottom - down * (bottom-top)]
+        for name, color in (("coinbase", COINBASE_COLOR),
+                            ("up", UP_COLOR), ("down", DOWN_COLOR)):
             if len(points[name]) >= 4:
                 c.create_line(*points[name], fill=color, width=2)
         pressure_points = []
