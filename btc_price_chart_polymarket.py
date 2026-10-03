@@ -49,10 +49,23 @@ MIN_ENTRY_PRICE = Decimal("0.30")
 MAX_ENTRY_PRICE = Decimal("0.70")
 STAKE = Decimal("1.10")
 TAKE_PROFIT = Decimal("0.05")
-ENTRY_SLIPPAGE = Decimal("0.04")
-TP_BALANCE_WAIT_SECONDS = 15.0
+# FAK buy limit = quoted ask + this band. Wider band = more aggressive fill
+# on thin/moving books; you only ever pay the actual best available ask.
+ENTRY_SLIPPAGE = Decimal("0.06")
+# Polymarket allows ~9,000 req/10s per key, so every balance poll / retry
+# below can run as fast as the network round-trip. These caps only bound a
+# failed lookup; the happy path never waits for them.
+# Hard exit clock: this long after a fill the position is force-sold at the
+# market. Polymarket's CTF balance only becomes sellable once its indexer
+# catches the fill (lags a beat), so a dedicated worker hammers
+# update_balance_allowance from fill time and posts the FAK market sell the
+# instant the balance is live — the 0.5s sell actually fires.
+RESTING_TIMEOUT_SECONDS = 0.5
+REINDEX_POLL_SECONDS = 0.02
 SELL_RETRY_SECONDS = 0.02
-SELL_RETRY_WINDOW_SECONDS = 2.0
+SELL_RETRY_WINDOW_SECONDS = 8.0
+RESTING_CANCEL_LEAD_SECONDS = 5.0
+RESTING_FILL_POLL_SECONDS = 0.02
 TREND_SECONDS = 10.0
 TREND_MIN_MOVE = 1.0
 FRAME_MS = 20
@@ -469,7 +482,7 @@ class EventDrivenJumpDetector:
 
 
 class PolymarketJumpTrader:
-    """One jump entry with a software-triggered 5% FOK market sell."""
+    """One jump entry with a resting limit take-profit sell on Polymarket."""
 
     def __init__(self, live=False):
         self.live = live
@@ -486,7 +499,8 @@ class PolymarketJumpTrader:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
                     tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
-                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+                    tp_state TEXT, target TEXT, created REAL, detail TEXT,
+                    filled_at REAL, sold_at REAL)""")
                 db.execute("""INSERT INTO trades
                     (market,outcome,move,token,tick,entry_state,price,shares,
                      tp_state,target,created,detail)
@@ -499,7 +513,8 @@ class PolymarketJumpTrader:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     market TEXT NOT NULL, outcome TEXT, move REAL, token TEXT,
                     tick TEXT, entry_state TEXT, price TEXT, shares TEXT,
-                    tp_state TEXT, target TEXT, created REAL, detail TEXT)""")
+                    tp_state TEXT, target TEXT, created REAL, detail TEXT,
+                    filled_at REAL, sold_at REAL)""")
             db.execute("CREATE INDEX IF NOT EXISTS trades_market_idx "
                        "ON trades(market, created)")
             columns = [row[1] for row in db.execute(
@@ -510,6 +525,15 @@ class PolymarketJumpTrader:
                            "WHERE request_id IS NULL")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_request_idx "
                        "ON trades(request_id)")
+            # Timestamps for when the bet executed (filled_at) and when the
+            # position was sold (sold_at). Back-filled for any pre-existing
+            # rows from the closest column already available.
+            for column, backfill in (
+                    ("filled_at", "created"), ("sold_at", "created")):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE trades ADD COLUMN {column} REAL")
+                    db.execute(f"UPDATE trades SET {column}={backfill} "
+                               f"WHERE {column} IS NULL")
             db.execute("""UPDATE trades SET entry_state='rejected'
                 WHERE entry_state='unknown' AND price IS NULL
                   AND LOWER(detail) LIKE '%fully filled or killed%'""")
@@ -517,9 +541,14 @@ class PolymarketJumpTrader:
         self.status = "ready; waiting for jump"
         self.stop = threading.Event()
         self.position_cache = (None, 0.0, None)
-        self.latest_cache = (0.0, None)
+        self.latest_cache = (None, 0.0, None)
         self.open_position = None
         self.next_sell_attempt = 0.0
+        # Trade IDs closed by the resting-TP fill watch / settle-cancel. Their
+        # DB row still reads "watching" for a moment before the writer thread
+        # commits "sold", so position() uses this set to not show a phantom
+        # open position during that lag.
+        self.settled_trades = set()
         self.window_counts = {}
         self.pending_markets = set()
         self.prepared_markets = set()
@@ -593,6 +622,7 @@ class PolymarketJumpTrader:
                 "outcome": row["outcome"],
                 "token": row["token"], "tick": Decimal(row["tick"]),
                 "shares": Decimal(row["shares"]),
+                "entry": Decimal(row["price"]),
                 "target": Decimal(row["target"]), "selling": False,
                 "sell_deadline": None,
             }
@@ -752,7 +782,28 @@ class PolymarketJumpTrader:
         self.persist_queue.put(("update", request_id, fields))
         with self.lock:
             self.position_cache = (None, 0.0, None)
-            self.latest_cache = (0.0, None)
+            self.latest_cache = (None, 0.0, None)
+
+    def _entry_order_terms(self, ask, tick):
+        """Return limit, USDC buy amount, and order type for an entry."""
+        limit = (min(Decimal("0.99"), ask + ENTRY_SLIPPAGE) /
+                 tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        return limit, Decimal(STAKE), "FAK"
+
+    def _create_entry_order(self, token, limit, buy_amount,
+                            entry_order_type, options):
+        """Create the default USDC-amount market entry order.
+
+        Specialized front ends may override this hook when they need an exact
+        share quantity instead of spending an exact USDC amount.
+        """
+        MarketOrderArgs, OrderType, _, Side = self.order_api
+        order_type = getattr(OrderType, entry_order_type)
+        signed = self.client.create_market_order(
+            MarketOrderArgs(token_id=token, amount=float(buy_amount),
+                            side=Side.BUY, price=float(limit),
+                            order_type=order_type), options)
+        return signed, order_type
 
     def _execute(self, request_id, slug, outcome, token, tick_text, ask_text):
         worker_at = time.monotonic()
@@ -765,29 +816,33 @@ class PolymarketJumpTrader:
                 timing["result"] = "submitting"
         tick = Decimal(tick_text)
         ask = Decimal(ask_text)
-        limit = (min(Decimal("0.99"), ask + ENTRY_SLIPPAGE) /
-                 tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        # WIDE limit: a FAK market buy fills every ask at or below the limit,
+        # so a higher limit is more aggressive and more likely to fill on a
+        # thin book. We still only pay the actual best available ask. The
+        # entry filter (MIN/MAX_ENTRY_PRICE) caps the price we ever pay.
+        limit, buy_amount, entry_order_type = self._entry_order_terms(ask, tick)
         if not self.live:
             self._update(request_id, entry_state="simulated",
-                         detail=f"dry run ${STAKE}, ask {ask}, limit {limit}")
+                         detail=(f"dry run ${buy_amount}, ask {ask}, "
+                                 f"limit {limit}"))
             with self.lock:
                 self.pending_markets.discard(slug)
                 self.window_counts[slug] = self.window_counts.get(slug, 0) + 1
-                self.status = (f"DRY RUN {outcome}; ${STAKE}, ask {ask}, "
+                self.status = (f"DRY RUN {outcome}; ${buy_amount}, ask {ask}, "
                                f"limit {limit}")
             self._timing_update(request_id, "simulated", time.monotonic())
             return
         filled = False
         try:
-            MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side = self.order_api
+            _, _, PartialCreateOrderOptions, _ = self.order_api
             options = PartialCreateOrderOptions(tick_size=tick_text,
                                                 neg_risk=False)
-            signed = self.client.create_market_order(
-                MarketOrderArgs(token_id=token, amount=float(STAKE),
-                                side=Side.BUY, price=float(limit),
-                                order_type=OrderType.FOK), options)
+            # The default profile uses FAK market orders. Web/live profiles
+            # can override the creation hook for exact-share FOK orders.
+            signed, order_type = self._create_entry_order(
+                token, limit, buy_amount, entry_order_type, options)
             response = self.client.post_order(
-                signed, OrderType.FOK, defer_exec=True)
+                signed, order_type, defer_exec=True)
             if (not response.get("success") or
                     str(response.get("status", "")).lower() != "matched"):
                 self._update(request_id, entry_state="rejected",
@@ -799,24 +854,57 @@ class PolymarketJumpTrader:
                 return
             paid = Decimal(str(response["makingAmount"]))
             shares = Decimal(str(response["takingAmount"]))
+            if shares <= 0 or paid <= 0:
+                self._update(request_id, entry_state="rejected",
+                             detail=json.dumps(response)[:4000])
+                with self.lock:
+                    self.pending_markets.discard(slug)
+                    self.status = f"{outcome} order filled nothing (thin book)"
+                self._timing_update(request_id, "rejected", time.monotonic())
+                return
             price = paid / shares
             target = (price * (Decimal("1") + TAKE_PROFIT) / tick).to_integral_value(
                 rounding=ROUND_CEILING) * tick
             self._update(request_id, entry_state="filled", price=str(price),
                          shares=str(shares), tp_state="watching",
-                         target=str(target), detail=json.dumps(response)[:4000])
+                         target=str(target), filled_at=time.time(),
+                         detail=json.dumps(response)[:4000])
             filled = True
+            position = {
+                "id": request_id, "market": slug, "outcome": outcome, "token": token,
+                "tick": tick, "shares": shares, "entry": price, "target": target,
+                "selling": False, "sell_deadline": None,
+                # Hard exit clock: 0.5s after this fill, if the resting TP
+                # has not filled at target, the position is force-sold at the
+                # market bid (observe/_sell). Never rides a dead trend.
+                "deadline": time.monotonic() + RESTING_TIMEOUT_SECONDS,
+                # The TP arm retries placement while the balance indexer lags
+                # (it may only be able to land a beat after the 0.5s deadline).
+                # Once placed, this is how long the resting TP is allowed to
+                # sit in the book before the software force-sell takes over.
+                "tp_deadline": time.monotonic() + RESTING_TIMEOUT_SECONDS * 2,
+                "exit_mode": "software",
+                "resting_order_id": None, "resting_placed": False,
+            }
             with self.lock:
-                self.open_position = {
-                    "id": request_id, "market": slug, "outcome": outcome, "token": token,
-                    "tick": tick, "shares": shares, "target": target,
-                    "selling": False, "sell_deadline": None,
-                }
+                self.open_position = position
                 self.pending_markets.discard(slug)
                 self.window_counts[slug] = self.window_counts.get(slug, 0) + 1
-                self.status = (f"{outcome} filled {price:.4f}; software sell "
-                               f"target {target:.4f}")
+                self.status = (f"{outcome} filled {price:.4f}; TP order "
+                               f"{target:.4f} outgoing")
             self._timing_update(request_id, "filled", time.monotonic())
+            # Fire-and-forget exit workers, started the instant the fill
+            # returns: (1) a reindex thread hammers update_balance_allowance
+            # so Polymarket's CTF balance indexer catches the fill fast (this
+            # is what stops both the resting-TP arm and the 0.5s force-sell
+            # failing with "not enough balance"); (2) the arm thread posts the
+            # take-profit resting limit SELL at target the moment it can.
+            threading.Thread(
+                target=self._reindex_balance, args=(dict(position),),
+                name="polymarket-reindex", daemon=True).start()
+            threading.Thread(
+                target=self._arm_take_profit, args=(dict(position),),
+                name="polymarket-arm-take-profit", daemon=True).start()
             if target >= Decimal("1"):
                 self._update(request_id, tp_state="unreachable")
                 with self.lock:
@@ -827,6 +915,11 @@ class PolymarketJumpTrader:
             fields = {"detail": f"{type(exc).__name__}: {str(exc)[:500]}"}
             if filled:
                 fields["tp_state"] = "unknown"
+            elif ("no orders found to match with FAK" in str(exc)
+                    or "partially filled or killed" in str(exc).lower()):
+                fields["entry_state"] = "rejected"
+                fields["detail"] = ("no book depth at posted price (FAK "
+                                    "killed): " + str(exc)[:300])
             elif "fully filled or killed" in str(exc).lower():
                 fields["entry_state"] = "rejected"
             else:
@@ -846,38 +939,62 @@ class PolymarketJumpTrader:
                                    "check Polymarket")
 
     def observe(self, slug, quotes):
-        """Watch the live bid and submit a market sell at the software target."""
+        """Software exit: FAK market sell at the available bid.
+
+        Fires when:
+        1. The TP deadline has passed — the resting TP is not filling at
+           target fast enough, so sell NOW at whatever the bid is (no target
+           check) and never ride a dead trend. When a resting TP is live it
+           gets the full tp_deadline window; otherwise the shorter 0.5s
+           deadline applies.
+        2. No resting TP is armed yet and the bid already sits at/above
+           target.
+
+        Retries are capped by sell_deadline (SELL_RETRY_WINDOW_SECONDS); the
+        exit is a FAK market sell, so it takes whatever depth is available.
+        """
         if not self.live:
             return
+        now = time.monotonic()
         with self.lock:
             position = self.open_position
             if (not position or position["market"] != slug or
-                    position["selling"] or time.monotonic() < self.next_sell_attempt):
+                    position["selling"]):
                 return
-            quote = quotes.get(position["outcome"])
-            if quote is None or Decimal(quote.bid) < position["target"]:
-                return
-            if position["sell_deadline"] is None:
-                position["sell_deadline"] = (
-                    time.monotonic() + SELL_RETRY_WINDOW_SECONDS)
-                timed_out = False
-            elif time.monotonic() >= position["sell_deadline"]:
+            resting_live = (position.get("resting_placed") and
+                            position.get("exit_mode", "software") == "resting")
+            deadline = (position.get("tp_deadline") if resting_live
+                        else position.get("deadline"))
+            if deadline is not None and now >= deadline:
+                force = True
+            elif resting_live:
+                return  # resting TP live and still inside its window
+            else:
+                quote = quotes.get(position["outcome"])
+                if quote is None or Decimal(quote.bid) < position["target"]:
+                    return
+                force = False
+            if position.get("sell_deadline") is None:
+                position["sell_deadline"] = now + SELL_RETRY_WINDOW_SECONDS
+            elif now >= position["sell_deadline"]:
                 self.open_position = None
-                self.status = "software sell stopped after 2 seconds"
-                timed_out = True
-            else:
-                timed_out = False
-            if timed_out:
-                bid = None
-            else:
-                position["selling"] = True
-                bid = Decimal(quote.bid)
-                self.status = (f"software sell triggered {position['outcome']} "
-                               f"bid {bid:.3f}")
-        if timed_out:
-            self._update(position["id"], tp_state="sell_timeout")
-            return
-        self._update(position["id"], tp_state="selling")
+                self.status = "software sell stopped after window"
+                self._update(position["id"], tp_state="sell_timeout")
+                return
+            position["selling"] = True
+            quote = quotes.get(position["outcome"])
+            bid = Decimal(quote["bid"]) if quote else None
+            trade_id = position["id"]
+        if force and position.get("exit_mode") == "resting":
+            # Pull the resting maker TP so the forced market sell is the only
+            # live exit order (no orphaned limit, no double-offer).
+            self._cancel_resting(trade_id)
+        self._update(trade_id, tp_state="selling")
+        with self.lock:
+            self.status = (f"{'forced ' if force else ''}software sell "
+                           f"triggered {position['outcome']}"
+                           + (f" bid {bid:.3f}" if bid is not None
+                              else " (no bid quote)"))
         threading.Thread(target=self._sell,
                          args=(dict(position), bid),
                          name="chart-polymarket-sell", daemon=True).start()
@@ -886,46 +1003,57 @@ class PolymarketJumpTrader:
         slug = position["market"]
         trade_id = position["id"]
         try:
-            from py_clob_client_v2 import (AssetType, BalanceAllowanceParams,
-                                           MarketOrderArgs, OrderType,
+            from py_clob_client_v2 import (MarketOrderArgs, OrderType,
                                            PartialCreateOrderOptions, Side)
             token, shares, tick = (position["token"], position["shares"],
                                    position["tick"])
-            balance_params = BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL, token_id=token)
-            deadline = min(time.monotonic() + TP_BALANCE_WAIT_SECONDS,
-                           position["sell_deadline"])
-            while True:
-                self.client.update_balance_allowance(balance_params)
-                balance = self.client.get_balance_allowance(balance_params)
-                indexed = (Decimal(str(balance.get("balance", "0"))) /
-                           Decimal("1000000"))
-                if indexed >= shares:
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("purchased token balance not indexed for sell")
-                time.sleep(SELL_RETRY_SECONDS)
-            # Once the software TP is reached, prioritize an immediate exit.
-            # A SELL limit at the minimum valid tick may sweep every available
-            # bid; FOK still prevents a partial position from being left open.
-            limit = tick
+            # No balance-read gate: the reindex thread hammers
+            # update_balance_allowance in parallel, so we simply POST the FAK
+            # market sell back-to-back and let the server validate the balance.
+            # The first post after the indexer catches the fill matches; until
+            # then the post is rejected ("not enough balance") and we retry.
+            # FAK (fill-and-kill) sells the available depth at the floor rather
+            # than hard-failing the whole exit on a thin book.
+            deadline = position["sell_deadline"]
+            if deadline is None:
+                deadline = time.monotonic() + SELL_RETRY_WINDOW_SECONDS
             options = PartialCreateOrderOptions(tick_size=str(tick),
                                                 neg_risk=False)
-            signed = self.client.create_market_order(
-                MarketOrderArgs(token_id=token, amount=float(shares),
-                                side=Side.SELL, price=float(limit),
-                                order_type=OrderType.FOK), options)
-            response = self.client.post_order(
-                signed, OrderType.FOK, defer_exec=True)
-            if (not response.get("success") or
-                    str(response.get("status", "")).lower() != "matched"):
-                raise ValueError("software sell not confirmed matched")
-            self._update(trade_id, tp_state="sold",
-                         detail=json.dumps(response)[:4000])
-            with self.lock:
-                self.open_position = None
-                self.status = (f"{position['outcome']} aggressive software "
-                               f"sell filled (floor {limit:.3f})")
+            limit = tick
+            last_err = None
+            while not self.stop.is_set() and time.monotonic() < deadline:
+                with self.lock:
+                    closed = (not self.open_position or
+                              self.open_position.get("id") != trade_id)
+                if closed:
+                    return
+                try:
+                    signed = self.client.create_market_order(
+                        MarketOrderArgs(token_id=token, amount=float(shares),
+                                        side=Side.SELL, price=float(limit),
+                                        order_type=OrderType.FAK), options)
+                    response = self.client.post_order(
+                        signed, OrderType.FAK, defer_exec=True)
+                    if (response.get("success") and
+                            str(response.get("status", "")).lower() == "matched"):
+                        self._update(trade_id, tp_state="sold",
+                                     sold_at=time.time(),
+                                     detail=json.dumps(response)[:4000])
+                        with self.lock:
+                            self.open_position = None
+                            self.settled_trades.add(trade_id)
+                            self.status = (f"{position['outcome']} aggressive "
+                                           f"software sell filled (floor "
+                                           f"{limit:.3f})")
+                        return
+                    last_err = ValueError(
+                        f"sell not matched: {str(response)[:200]}")
+                except Exception as exc:
+                    last_err = exc
+                self.stop.wait(0.01)
+            if last_err:
+                raise last_err
+            raise TimeoutError("software sell not confirmed before window")
         except Exception as exc:
             timed_out = time.monotonic() >= position["sell_deadline"]
             self._update(trade_id,
@@ -940,6 +1068,253 @@ class PolymarketJumpTrader:
                     self.next_sell_attempt = time.monotonic() + SELL_RETRY_SECONDS
                     self.status = (f"software sell retry in 20ms: "
                                    f"{type(exc).__name__}")
+
+    def _reindex_balance(self, position):
+        """Hammer update_balance_allowance from the fill instant.
+
+        Polymarket's CTF balance for a token only becomes spendable once its
+        indexer catches the fill — which lags a few hundred ms. Both the
+        resting-TP arm and the 0.5s force-sell fail with "not enough balance"
+        until that indexer catches up. This dedicated thread re-triggers the
+        on-chain balance refresh as fast as the network allows (warm RTT ~64ms,
+        ~15/s), running in parallel with the arm thread and the software sell,
+        so the balance is sellable the instant any of them needs it. It stops
+        once the position is closed or superseded.
+        """
+        trade_id = position["id"]
+        token = position["token"]
+        try:
+            from py_clob_client_v2 import (AssetType, BalanceAllowanceParams)
+            balance_params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=token)
+        except Exception:
+            return
+        while not self.stop.is_set():
+            with self.lock:
+                pos = self.open_position
+                # Keep hammering until this position is actually closed
+                # (None) or superseded by a newer trade. Crucially, do NOT stop
+                # when selling starts — the software FAK sell needs the balance
+                # to be indexed to match, so keep re-indexing through the sell.
+                if not pos or pos.get("id") != trade_id:
+                    return
+            try:
+                self.client.update_balance_allowance(balance_params)
+            except Exception:
+                pass
+            self.stop.wait(REINDEX_POLL_SECONDS)
+
+    def _arm_take_profit(self, position):
+        """Post the take-profit as a resting maker SELL on Polymarket.
+
+        A software TP watches the bid in Python and, by the time it posts the
+        market sell, the whipsaw is usually already back — so fills land at or
+        below target. Posting a limit SELL at the target instead puts the exit
+        in the book the moment the balance is indexed; the exchange then fills
+        us at target-or-better with zero reaction delay, and it can never fail
+        on a thin book because it is already resting in it.
+
+        The FAK software sell (observe/_sell) remains as the safety net: if
+        the price reaches target but the resting limit has no bids in front of
+        it to cross, the fallback takes the available depth at the floor.
+        """
+        trade_id = position["id"]
+        token, shares, tick, target = (position["token"], position["shares"],
+                                       position["tick"], position["target"])
+        if target >= Decimal("1"):
+            return
+        # Window end: slug = btc-updown-5m-{start}; market settles at start+300.
+        settle_at = position.get("settle_at") or self._settle_at(position["market"])
+        from py_clob_client_v2 import (AssetType, BalanceAllowanceParams,
+                                       OrderArgs, OrderType,
+                                       PartialCreateOrderOptions, Side)
+        balance_params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL, token_id=token)
+        options = PartialCreateOrderOptions(tick_size=str(tick),
+                                            neg_risk=False)
+        # Wait on the book, then protect. We cannot attach a TP to a fill
+        # that Polymarket has not indexed yet — the entry matched, but the
+        # sellable balance only appears in the book once the indexer catches
+        # the fill (lags a few hundred ms). So: poll (update + get) until the
+        # indexed balance covers our shares, and ONLY then post the resting
+        # limit SELL. No fixed wait cap — poll as fast as the network allows;
+        # the only real boundary is settlement (don't post a sell in the last
+        # 2s). The reindex thread hammers update_balance_allowance in
+        # parallel, so the book shows the fill quickly.
+        deadline = settle_at - 2
+        placed = False
+        order_id = None
+        while not self.stop.is_set() and time.monotonic() < deadline:
+            # Bail if the position was closed/superseded (or already placed).
+            # Do NOT bail when selling=True: the book may only show the fill
+            # a beat after the 0.5s force-sell deadline — keep waiting.
+            with self.lock:
+                pos = self.open_position
+                if (not pos or pos["id"] != trade_id or pos.get("resting_placed")):
+                    return
+            # 1) WAIT: re-index, then read the book. Keep polling until the
+            # balance is sellable (indexed >= our shares).
+            try:
+                self.client.update_balance_allowance(balance_params)
+                balance = self.client.get_balance_allowance(balance_params)
+                remaining = (Decimal(str(balance.get("balance", "0"))) /
+                             Decimal("1000000"))
+            except Exception:
+                remaining = Decimal("0")
+            if remaining + Decimal("0.001") < shares:
+                with self.lock:
+                    self.status = (f"{position['outcome']} TP waiting for "
+                                   f"fill in book ({remaining:.3f}/"
+                                   f"{float(shares):.3f} sh)")
+                self.stop.wait(0.02)
+                continue
+            # 2) PROTECT: the fill is live in the book — post the resting
+            # limit SELL at target (shares, not dollars).
+            try:
+                signed = self.client.create_order(
+                    OrderArgs(token_id=token, price=float(target),
+                              size=float(shares), side=Side.SELL), options)
+                response = self.client.post_order(signed, OrderType.GTC)
+                order_id = self._order_id_from(response)
+                if not order_id:
+                    raise ValueError(f"no order id: {str(response)[:120]}")
+                with self.lock:
+                    pos = self.open_position
+                    still_open = bool(pos and pos["id"] == trade_id)
+                    if still_open:
+                        pos["resting_order_id"] = order_id
+                        pos["resting_placed"] = True
+                        pos["exit_mode"] = "resting"
+                if not still_open:
+                    # The position was already closed by the software force
+                    # sell while we were waiting, so this just-posted limit
+                    # would be orphaned. Pull it and stop — it cannot fill
+                    # (the shares are gone) and leaving it would be noise.
+                    self._cancel_order(order_id)
+                    return
+                self._update(trade_id, tp_state="watching")
+                with self.lock:
+                    self.status = (f"{position['outcome']} TP limit resting "
+                                   f"@ {target:.4f} ({float(shares):.3f} sh)")
+                placed = True
+                break
+            except Exception as exc:
+                err = str(exc)
+                # If the book changed under us (partial consumption, balance
+                # dropped), re-check on the next pass — keep waiting.
+                with self.lock:
+                    self.status = (f"TP arm {type(exc).__name__}: {err[:120]}")
+                self.stop.wait(0.02)
+        # Order is live. The whole exit has RESTING_TIMEOUT_SECONDS from the
+        # buy (position["deadline"]): if the resting limit fills at target in
+        # time (balance drops) we finalize the win immediately. Otherwise the
+        # watch loop ends and the software sell loop (observe) force-sells the
+        # position at the current bid on its next poll.
+        if not (placed and not self.stop.is_set()):
+            return
+        threshold = shares - Decimal("0.001")
+        with self.lock:
+            pos = self.open_position
+            if not (pos and pos["id"] == trade_id):
+                return  # closed/superseded while we were (re)posting
+            tp_deadline = (pos.get("tp_deadline")
+                           or pos.get("deadline") or time.monotonic())
+        watch_until = max(time.monotonic(),
+                          min(tp_deadline, settle_at - RESTING_CANCEL_LEAD_SECONDS))
+        while not self.stop.is_set() and time.monotonic() < watch_until:
+            self.stop.wait(min(RESTING_FILL_POLL_SECONDS,
+                               max(0.0, watch_until - time.monotonic())))
+            with self.lock:
+                pos = self.open_position
+                still_mine = bool(pos and pos.get("id") == trade_id)
+            if not still_mine:
+                # The software force-sell already closed this position (or a
+                # newer trade superseded it): pull the resting TP so it does
+                # not linger in the book with no shares behind it.
+                self._cancel_order(order_id)
+                return
+            # update (re-index) then get: two sequential RTTs.
+            try:
+                self.client.update_balance_allowance(balance_params)
+                balance = self.client.get_balance_allowance(balance_params)
+                remaining = (Decimal(str(balance.get("balance", "0"))) /
+                             Decimal("1000000"))
+            except Exception:
+                continue
+            if remaining < threshold:
+                self._finalize_sold(trade_id, position, target, by="resting")
+                return
+        # Deadline reached with the resting TP unfilled: pull the limit so the
+        # shares are free for the forced market sell (observe handles it).
+        self._cancel_resting(trade_id)
+
+    def _finalize_sold(self, trade_id, position, target, by):
+        """Close a position out after its take-profit filled (resting limit or
+        software FAK). Clear the open slot so new entries in this window are
+        allowed and the DB row reflects the win."""
+        with self.lock:
+            pos = self.open_position
+            if pos is not None and pos.get("id") == trade_id:
+                self.open_position = None
+                self.status = (f"{position['outcome']} take-profit filled "
+                               f"(target {target:.4f}, via {by})")
+        self._update(trade_id, tp_state="sold", sold_at=time.time())
+        with self.lock:
+            self.settled_trades.add(trade_id)
+
+    def _settle_at(self, slug):
+        try:
+            return int(slug.rsplit("-", 1)[1]) + WINDOW_SECONDS
+        except (ValueError, IndexError):
+            return time.time() + WINDOW_SECONDS
+
+    def _order_id_from(self, response):
+        for key in ("orderID", "orderId", "order_id", "id"):
+            value = response.get(key) if isinstance(response, dict) else None
+            if value:
+                return str(value)
+        return None
+
+    def _cancel_order(self, order_id):
+        """Cancel a single order by id, ignoring failures (e.g. it already
+        filled or was never live)."""
+        if not order_id:
+            return
+        try:
+            from py_clob_client_v2 import OrderPayload
+            self.client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception:
+            pass
+
+    def _cancel_resting(self, trade_id):
+        """Pull the resting TP limit so the shares are free to be force-sold.
+
+        Keeps the position open in resting mode with its deadline set, so the
+        software sell loop (observe) force-sells it at the current bid on its
+        next poll. Called when the resting limit did not fill in time (or the
+        window is closing).
+        """
+        with self.lock:
+            pos = self.open_position
+            if not pos or pos.get("id") != trade_id:
+                return
+            order_id = pos.get("resting_order_id")
+        if not order_id:
+            return
+        try:
+            from py_clob_client_v2 import OrderPayload
+            self.client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception:
+            pass
+        with self.lock:
+            pos = self.open_position
+            if pos and pos.get("id") == trade_id:
+                pos["resting_placed"] = False
+                pos["resting_order_id"] = None
+                if pos.get("deadline") is None:
+                    pos["deadline"] = time.monotonic()
+                self.status = (f"TP limit not filled in time; forcing sell "
+                               f"({pos['outcome']})")
 
     def _row(self, slug=None):
         with sqlite3.connect(self.db_path) as db:
@@ -963,40 +1338,51 @@ class PolymarketJumpTrader:
                 WHERE market=? AND entry_state='filled'
                   AND COALESCE(tp_state,'') != 'sold'
                 ORDER BY created DESC LIMIT 1""", (slug,)).fetchone()
+        # A trade closed by the resting-TP fill watch (or the settle-cancel)
+        # has no live position any more, even though its DB row may still read
+        # "watching" for a moment before the writer thread commits "sold".
+        if row is not None and row["request_id"] in self.settled_trades:
+            row = None
         if not row or row["entry_state"] != "filled" or not row["price"]:
             position = None
         else:
             price = Decimal(row["price"])
             target = Decimal(row["target"])
+            with self.lock:
+                live = self.open_position
+                exit_mode = (live.get("exit_mode", "software") if live
+                             and live.get("id") == row["request_id"] else "software")
             position = {
                 "outcome": row["outcome"],
                 "shares": float(row["shares"]),
                 "entry": position_on_up_axis(row["outcome"], price),
                 "target": position_on_up_axis(row["outcome"], target),
                 "tp_state": row["tp_state"] or "unknown",
+                "exit_mode": exit_mode,
             }
         with self.lock:
             self.position_cache = (slug, now, position)
         return position
 
-    def latest_trade(self):
+    def latest_trade(self, slug=None):
         now = time.monotonic()
         with self.lock:
-            checked, cached = self.latest_cache
-            if now - checked < 0.25:
+            cached_slug, checked, cached = self.latest_cache
+            if slug is not None and cached_slug == slug and now - checked < 0.25:
                 return cached
-        row = self._row()
+        row = self._row(slug)
         if not row:
-            return None
-        trade = {
-            "market": row["market"], "outcome": row["outcome"],
-            "move": row["move"], "entry_state": row["entry_state"],
-            "price": row["price"], "shares": row["shares"],
-            "target": None if row["target"] is None else float(row["target"]),
-            "tp_state": row["tp_state"], "detail": row["detail"] or "",
-        }
+            trade = None
+        else:
+            trade = {
+                "market": row["market"], "outcome": row["outcome"],
+                "move": row["move"], "entry_state": row["entry_state"],
+                "price": row["price"], "shares": row["shares"],
+                "target": None if row["target"] is None else float(row["target"]),
+                "tp_state": row["tp_state"], "detail": row["detail"] or "",
+            }
         with self.lock:
-            self.latest_cache = (now, trade)
+            self.latest_cache = (slug, now, trade)
         return trade
 
     def close(self):
