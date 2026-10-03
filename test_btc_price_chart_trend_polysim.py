@@ -33,7 +33,7 @@ class RestingBidPressureStrategyTests(unittest.TestCase):
     def test_polysimulator_take_profit_is_ten_percent(self):
         self.assertEqual(TAKE_PROFIT_RATE, Decimal("0.10"))
 
-    def test_only_one_trade_can_remain_open(self):
+    def test_entry_unlocks_after_polysimulator_accepts_tp(self):
         with tempfile.TemporaryDirectory() as folder:
             trader = JumpPaperTrader.__new__(JumpPaperTrader)
             trader.db_path = Path(folder) / "trades.sqlite3"
@@ -42,14 +42,14 @@ class RestingBidPressureStrategyTests(unittest.TestCase):
                 db.execute("""CREATE TABLE trades (
                     market TEXT, outcome TEXT, entry_state TEXT, tp_state TEXT)""")
                 db.execute("INSERT INTO trades VALUES (?,?,?,?)",
-                           ("window#jump-1", "Up", "filled", "watching"))
+                           ("window#jump-1", "Up", "filled", "needed"))
                 db.commit()
             finally:
                 db.close()
             self.assertTrue(trader.has_open_trade("window"))
             db = sqlite3.connect(trader.db_path)
             try:
-                db.execute("UPDATE trades SET tp_state='sold'")
+                db.execute("UPDATE trades SET tp_state='submitted'")
                 db.commit()
             finally:
                 db.close()

@@ -518,13 +518,14 @@ class JumpPaperTrader:
                               (slug,)).fetchone()
 
     def has_open_trade(self, slug):
-        """Return whether this market has an entry or position not yet sold."""
+        """Lock entries only until PolySimulator accepts the server-side TP."""
         db = sqlite3.connect(self.db_path)
         try:
             row = db.execute("""SELECT 1 FROM trades
                 WHERE market LIKE ?
-                  AND entry_state IN ('reserved','filled','retry')
-                  AND COALESCE(tp_state,'') != 'sold'
+                  AND (entry_state IN ('reserved','retry')
+                       OR (entry_state='filled'
+                           AND COALESCE(tp_state,'needed') != 'submitted'))
                 LIMIT 1""", (slug + "#jump-%",)).fetchone()
             return row is not None
         finally:
@@ -569,7 +570,7 @@ class JumpPaperTrader:
     def submit(self, slug, outcome, move, tick="0.01", token=None):
         with self.lock:
             if self.inflight or self.has_open_trade(slug):
-                self.status = "entry skipped: one trade is already open"
+                self.status = "entry skipped: waiting for PolySimulator TP submission"
                 return False
             last_slot, last_created = self.trade_window_state(slug)
             elapsed = time.time() - last_created
