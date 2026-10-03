@@ -661,6 +661,7 @@ class PriceChart:
         self.trend_signal_zone = None
         self.btc_trend_ticks = deque()
         self.up_trend_ticks = deque()
+        self.bid_pressure_samples = deque()
         self.discovery = Discovery(self.feed)
         self.samples, self.current_slug = deque(), None
         self.coinbase_offset = None
@@ -789,6 +790,10 @@ class PriceChart:
         bid_total = totals["Up"]["bid"] + totals["Down"]["bid"]
         up_depth_pct = (50.0 if not bid_total else
                         totals["Up"]["bid"] / bid_total * 100)
+        self.bid_pressure_samples.append((now, up_depth_pct / 100.0))
+        while (self.bid_pressure_samples and
+               self.bid_pressure_samples[0][0] < now - WINDOW_SECONDS):
+            self.bid_pressure_samples.popleft()
         flow_trades = [trade for trade in trades
                        if float(trade.get("timestamp", 0)) >= time.time() - 1.0]
         up_flow = down_flow = 0.0
@@ -862,6 +867,7 @@ class PriceChart:
             self.trend_signal_zone = None
             self.btc_trend_ticks.clear()
             self.up_trend_ticks.clear()
+            self.bid_pressure_samples.clear()
             self.coinbase_offset = None
         if (btc is not None and coinbase_price is not None and
                 self.coinbase_offset is None):
@@ -1039,6 +1045,8 @@ class PriceChart:
                       fill=COINBASE_COLOR, anchor="w")
         c.create_text(left + 155, 18, text="Polymarket Up",
                       fill=UP_COLOR, anchor="w")
+        c.create_text(left + 270, 18, text="UP bid pressure",
+                      fill=BTC_COLOR, anchor="w")
         trend_points = [
             (stamp, coinbase_price)
             for stamp, coinbase_price, _, _ in self.samples
@@ -1049,7 +1057,7 @@ class PriceChart:
             trend_color = (UP_COLOR if direction == "UP" else
                            DOWN_COLOR if direction == "DOWN" else MUTED)
             arrow = "↑" if direction == "UP" else "↓" if direction == "DOWN" else "→"
-            c.create_text(left + 300, 18,
+            c.create_text(left + 400, 18,
                           text=f"{arrow} {direction} {move:+.2f} / {TREND_SECONDS:.0f}s",
                           fill=trend_color, anchor="w",
                           font=("Consolas", 10, "bold"))
@@ -1096,6 +1104,13 @@ class PriceChart:
         for name, color in (("coinbase", COINBASE_COLOR), ("up", UP_COLOR)):
             if len(points[name]) >= 4:
                 c.create_line(*points[name], fill=color, width=2, smooth=True)
+        pressure_points = []
+        for stamp, pressure in self.bid_pressure_samples:
+            x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
+            pressure_points += [x, bottom - pressure * (bottom - top)]
+        if len(pressure_points) >= 4:
+            c.create_line(*pressure_points, fill=BTC_COLOR, width=2,
+                          dash=(5, 3), smooth=True)
         if trend:
             direction, _, fitted_start, fitted_end = trend
             trend_color = (UP_COLOR if direction == "UP" else
