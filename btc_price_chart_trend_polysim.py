@@ -29,7 +29,9 @@ BITSTAMP_API = "https://www.bitstamp.net/api/v2/ticker/btcusd/"
 OKX_API = "https://www.okx.com/api/v5/market/ticker"
 BYBIT_API = "https://api.bybit.com/v5/market/tickers"
 GEMINI_API = "https://api.gemini.com/v1/pubticker/btcusd"
-WINDOW_SECONDS = 300.0
+# Rolling display history. The traded Polymarket market remains five minutes;
+# this only controls how much data the chart retains and draws.
+WINDOW_SECONDS = 60.0
 TRADE_START_DELAY_SECONDS = 0.0
 TRADE_COOLDOWN_SECONDS = 1.0
 JUMP_TP_RATE = Decimal("0.10")
@@ -1103,25 +1105,14 @@ class PriceChart:
                 points["up"] += [x, bottom - up * (bottom-top)]
         for name, color in (("coinbase", COINBASE_COLOR), ("up", UP_COLOR)):
             if len(points[name]) >= 4:
-                c.create_line(*points[name], fill=color, width=2, smooth=True)
+                c.create_line(*points[name], fill=color, width=2)
         pressure_points = []
         for stamp, pressure in self.bid_pressure_samples:
             x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
             pressure_points += [x, bottom - pressure * (bottom - top)]
         if len(pressure_points) >= 4:
             c.create_line(*pressure_points, fill=BTC_COLOR, width=2,
-                          dash=(5, 3), smooth=True)
-        if trend:
-            direction, _, fitted_start, fitted_end = trend
-            trend_color = (UP_COLOR if direction == "UP" else
-                           DOWN_COLOR if direction == "DOWN" else MUTED)
-            trend_xy = []
-            for stamp, price in (fitted_start, fitted_end):
-                x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
-                y = bottom - (price - low) / (high - low) * (bottom - top)
-                trend_xy.extend((x, y))
-            c.create_line(*trend_xy, fill=trend_color, width=3, dash=(6, 4))
-
+                          dash=(5, 3))
     def close(self):
         self.discovery.stop.set()
         self.btc_feed.stop.set()
