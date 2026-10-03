@@ -6,8 +6,8 @@ from pathlib import Path
 
 from btc_price_chart_trend_polysim import (
     JUMP_STAKE, MAX_ENTRY_PRICE, MIN_ENTRY_PRICE, JumpPaperTrader,
-    RESTING_BID_PRESSURE_EXIT, SELL_RETRY_ATTEMPTS, TRADE_COOLDOWN_SECONDS,
-    crossed_above, resting_pressure_crossing, should_exit_pressure,
+    TAKE_PROFIT_RATE, TRADE_COOLDOWN_SECONDS,
+    crossed_above, largest_depth_level, resting_pressure_crossing,
 )
 
 
@@ -30,13 +30,8 @@ class RestingBidPressureStrategyTests(unittest.TestCase):
     def test_trade_cooldown_is_five_seconds(self):
         self.assertEqual(TRADE_COOLDOWN_SECONDS, 5.0)
 
-    def test_software_exit_configuration(self):
-        self.assertEqual(RESTING_BID_PRESSURE_EXIT, 0.70)
-        self.assertGreater(SELL_RETRY_ATTEMPTS, 1)
-        self.assertTrue(should_exit_pressure("Up", 0.70))
-        self.assertTrue(should_exit_pressure("Down", 0.30))
-        self.assertFalse(should_exit_pressure("Up", 0.71))
-        self.assertFalse(should_exit_pressure("Down", 0.29))
+    def test_polysimulator_take_profit_is_ten_percent(self):
+        self.assertEqual(TAKE_PROFIT_RATE, Decimal("0.10"))
 
     def test_only_one_trade_can_remain_open(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -65,6 +60,16 @@ class RestingBidPressureStrategyTests(unittest.TestCase):
         self.assertEqual(resting_pressure_crossing(0.21, 0.19), ("Down", 0.81))
         self.assertIsNone(resting_pressure_crossing(0.85, 0.82))
         self.assertIsNone(resting_pressure_crossing(None, 0.10))
+
+    def test_largest_depth_level_projects_to_up_axis(self):
+        depth = {
+            "Up": {"bids": [(0.45, 10)], "asks": [(0.46, 20)]},
+            "Down": {"bids": [(0.53, 30)], "asks": [(0.54, 15)]},
+        }
+        self.assertEqual(largest_depth_level(depth, "bids"),
+                         ("Down", 0.53, 30.0, 0.47))
+        self.assertEqual(largest_depth_level(depth, "asks"),
+                         ("Up", 0.46, 20.0, 0.46))
 
 
 if __name__ == "__main__":

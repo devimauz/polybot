@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 import tkinter as tk
 from tkinter import ttk
 
@@ -34,11 +34,8 @@ WINDOW_SECONDS = 60.0
 TRADE_START_DELAY_SECONDS = 0.0
 TRADE_COOLDOWN_SECONDS = 5.0
 JUMP_STAKE = Decimal("100")
+TAKE_PROFIT_RATE = Decimal("0.10")
 RESTING_BID_PRESSURE_THRESHOLD = 0.80
-RESTING_BID_PRESSURE_EXIT = 0.70
-SELL_RETRY_ATTEMPTS = 5
-SELL_RETRY_SECONDS = 0.5
-SELL_SLIPPAGE = Decimal("0.05")
 MIN_ENTRY_PRICE = Decimal("0.30")
 MAX_ENTRY_PRICE = Decimal("0.70")
 MAX_ORDER_LIMIT = Decimal("0.99")
@@ -60,6 +57,8 @@ COINBASE_COLOR, BINANCE_COLOR = "#4d8dff", "#f08a24"
 KRAKEN_COLOR, BITSTAMP_COLOR = "#a970ff", "#45d6d0"
 OKX_COLOR, BYBIT_COLOR, GEMINI_COLOR = "#eeeeee", "#f4d03f", "#e056fd"
 POSITION_COLOR = "#5bc0ff"
+TOP_BID_COLOR = "#35d0ba"
+TOP_ASK_COLOR = "#ff9f43"
 
 
 def jump_direction(samples, threshold):
@@ -100,6 +99,18 @@ def position_on_up_axis(outcome, price):
     return price if outcome == "Up" else 1.0 - price
 
 
+def largest_depth_level(depth, side):
+    """Return the largest-share (outcome, price, size, UP-axis price) level."""
+    best = None
+    for outcome in ("Up", "Down"):
+        for price, size in depth.get(outcome, {}).get(side, []):
+            candidate = (outcome, float(price), float(size),
+                         position_on_up_axis(outcome, price))
+            if best is None or candidate[2] > best[2]:
+                best = candidate
+    return best
+
+
 def crossed_above(previous, current, threshold):
     """Return true only for a fresh upward crossing of a threshold."""
     return previous is not None and previous <= threshold < current
@@ -115,13 +126,6 @@ def resting_pressure_crossing(previous_up, current_up,
     if crossed_above(previous_down, current_down, threshold):
         return "Down", current_down
     return None
-
-
-def should_exit_pressure(outcome, up_pressure,
-                         threshold=RESTING_BID_PRESSURE_EXIT):
-    """Return true once the held outcome's resting bid pressure is 70% or less."""
-    side_pressure = up_pressure if outcome == "Up" else 1.0 - up_pressure
-    return side_pressure <= threshold
 
 
 def price_trend(points, min_move=TREND_MIN_MOVE):
@@ -411,7 +415,7 @@ class CoinbasePriceFeed:
 
 
 class JumpPaperTrader:
-    """PolySimulator pressure entries with retrying software pressure exits."""
+    """PolySimulator pressure entries with server-side 10% take-profits."""
 
     venue_name = "POLYSIM"
 
@@ -420,7 +424,8 @@ class JumpPaperTrader:
         self.http = httpx.Client(timeout=10)
         setup = OpeningBot(
             asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
-            db_path=self.db_path, http_client=self.http)
+            db_path=self.db_path, http_client=self.http,
+            take_profit=TAKE_PROFIT_RATE)
         setup.close()
         with sqlite3.connect(self.db_path) as db:
             db.execute("""CREATE TABLE IF NOT EXISTS jump_signals (
@@ -431,14 +436,20 @@ class JumpPaperTrader:
             db.execute("""INSERT OR IGNORE INTO jump_entries
                 (market,slot,trade_key,outcome,move,created)
                 SELECT market,1,market,outcome,move,created FROM jump_signals""")
+            db.execute("""UPDATE trades SET tp_state='needed'
+                WHERE entry_state='filled'
+                  AND tp_state IN ('watching','sell_retry')""")
         self.lock = threading.Lock()
         self.inflight = set()
         self.preparing = set()
         self.prepared = {}
-        self.status = "waiting for 80% entry pressure; software exit at 70%"
+        self.status = "waiting for 80% entry pressure; PolySimulator TP is 10%"
         self.position_cache = (None, 0.0, None)
         self.latest_cache = (0.0, None)
         self.stop = threading.Event()
+        self.maintenance = threading.Thread(
+            target=self._maintain, name="chart-pressure-tp", daemon=True)
+        self.maintenance.start()
 
     def snapshot(self):
         with self.lock:
@@ -461,12 +472,14 @@ class JumpPaperTrader:
         if row and row["price"]:
             price = Decimal(row["price"])
             tick = Decimal(row["tick"])
+            target = (price * (Decimal("1") + TAKE_PROFIT_RATE) / tick).to_integral_value(
+                rounding="ROUND_CEILING") * tick
             position = {
                 "outcome": row["outcome"],
                 "shares": float(row["shares"] or 0),
                 "entry": position_on_up_axis(row["outcome"], price),
-                "target": None,
-                "tp_state": row["tp_state"] or "watching",
+                "target": position_on_up_axis(row["outcome"], target),
+                "tp_state": row["tp_state"] or "needed",
             }
         with self.lock:
             self.position_cache = (slug, now, position)
@@ -489,7 +502,11 @@ class JumpPaperTrader:
         trade = None
         if row:
             trade = dict(row)
-            trade["target"] = None
+            if row["price"] and row["tick"]:
+                price, tick = Decimal(row["price"]), Decimal(row["tick"])
+                trade["target"] = float(
+                    (price * (Decimal("1") + TAKE_PROFIT_RATE) / tick).to_integral_value(
+                        rounding="ROUND_CEILING") * tick)
         with self.lock:
             self.latest_cache = (now, trade)
         return trade
@@ -528,7 +545,7 @@ class JumpPaperTrader:
             bot = OpeningBot(
                 asset="btc", amount=JUMP_STAKE, paper=True,
                 entry_window=300, db_path=self.db_path,
-                http_client=self.http)
+                http_client=self.http, take_profit=TAKE_PROFIT_RATE)
             for _ in range(10):
                 if self.stop.is_set():
                     return
@@ -582,7 +599,8 @@ class JumpPaperTrader:
         try:
             bot = OpeningBot(
                 asset="btc", amount=JUMP_STAKE, paper=True, entry_window=300,
-                db_path=self.db_path, http_client=self.http)
+                db_path=self.db_path, http_client=self.http,
+                take_profit=TAKE_PROFIT_RATE)
             with self.lock:
                 cached = self.prepared.get(expected_slug)
             if cached:
@@ -598,17 +616,22 @@ class JumpPaperTrader:
             row = bot.db.execute(
                 "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
                 (trade_key, outcome)).fetchone()
-            if row and row["entry_state"] == "filled":
-                bot.update(trade_key, outcome, tp_state="watching")
-                row = bot.db.execute(
-                    "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
-                    (trade_key, outcome)).fetchone()
             with self.lock:
                 self.status = (f"{outcome} " +
-                               (f"{row['entry_state']}; exit {row['tp_state']}"
+                               (f"{row['entry_state']}; TP {row['tp_state']}"
                                 if row else "entry skipped"))
                 self.position_cache = (None, 0.0, None)
                 self.latest_cache = (0.0, None)
+            bot.place_profits()
+            row = bot.db.execute(
+                "SELECT entry_state,tp_state FROM trades WHERE market=? AND outcome=?",
+                (trade_key, outcome)).fetchone()
+            if row:
+                with self.lock:
+                    self.status = (f"{outcome} {row['entry_state']}; "
+                                   f"TP {row['tp_state']}")
+                    self.position_cache = (None, 0.0, None)
+                    self.latest_cache = (0.0, None)
         except Exception as exc:
             with self.lock:
                 self.status = f"jump trade error: {type(exc).__name__}"
@@ -618,83 +641,21 @@ class JumpPaperTrader:
             with self.lock:
                 self.inflight.discard(trade_key)
 
-    def exit_on_pressure(self, slug, up_pressure, quotes):
-        """Start software exits when the held side's bid pressure reaches 70%."""
-        if up_pressure is None:
-            return
-        pressures = {"Up": up_pressure, "Down": 1.0 - up_pressure}
-        with sqlite3.connect(self.db_path) as db:
-            db.row_factory = sqlite3.Row
-            rows = db.execute("""SELECT rowid,* FROM trades
-                WHERE market LIKE ? AND entry_state='filled'
-                  AND tp_state IN ('watching','sell_retry')""",
-                              (slug + "#jump-%",)).fetchall()
-        for row in rows:
-            outcome = row["outcome"]
-            quote = quotes.get(outcome)
-            if (not should_exit_pressure(outcome, up_pressure)
-                    or quote is None or row["market"] in self.inflight):
-                continue
-            with self.lock:
-                if row["market"] in self.inflight:
-                    continue
-                self.inflight.add(row["market"])
-            threading.Thread(
-                target=self._sell_with_retries,
-                args=(dict(row), quote.bid, quote.tick, pressures[outcome]),
-                name="chart-pressure-sell", daemon=True).start()
-
-    def _sell_with_retries(self, position, bid, tick, pressure):
-        trade_key, outcome = position["market"], position["outcome"]
-        bot = None
-        try:
-            bot = OpeningBot(
-                asset="btc", amount=JUMP_STAKE, paper=True,
-                entry_window=300, db_path=self.db_path,
-                http_client=self.http)
-            bot.update(trade_key, outcome, tp_state="selling")
-            tick = Decimal(str(tick))
-            limit = max(tick, Decimal(str(bid)) - SELL_SLIPPAGE)
-            limit = (limit / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-            last_error = "sell not filled"
-            for attempt in range(1, SELL_RETRY_ATTEMPTS + 1):
-                if self.stop.is_set() or time.time() >= float(position["end"]):
-                    break
-                try:
-                    payload = bot.post({
-                        "market_id": position["cid"], "side": "SELL",
-                        "outcome": outcome, "quantity": position["shares"],
-                        "price": str(limit), "order_type": "market",
-                        "time_in_force": "FOK",
-                    })
-                    status = str(payload.get("status", "")).lower()
-                    if status in ("filled", "matched"):
-                        bot.update(trade_key, outcome, tp_state="sold",
-                                   detail=json.dumps(payload))
-                        with self.lock:
-                            self.status = (f"{outcome} software sell filled on "
-                                           f"attempt {attempt} at {pressure:.1%} pressure")
-                        return
-                    last_error = json.dumps(payload)[:1000]
-                except Exception as exc:
-                    last_error = bot.error_detail(exc)
+    def _maintain(self):
+        while not self.stop.wait(5):
+            bot = None
+            try:
+                bot = OpeningBot(
+                    asset="btc", amount=JUMP_STAKE, paper=True,
+                    entry_window=300, db_path=self.db_path,
+                    http_client=self.http, take_profit=TAKE_PROFIT_RATE)
+                bot.place_profits()
+            except Exception as exc:
                 with self.lock:
-                    self.status = (f"{outcome} software sell attempt {attempt}/"
-                                   f"{SELL_RETRY_ATTEMPTS} failed; retrying")
-                if attempt < SELL_RETRY_ATTEMPTS:
-                    self.stop.wait(SELL_RETRY_SECONDS)
-            bot.update(trade_key, outcome, tp_state="sell_retry",
-                       detail=last_error)
-            with self.lock:
-                self.status = (f"{outcome} software sell still pending; "
-                               "will retry while pressure is at/below 70%")
-        finally:
-            if bot is not None:
-                bot.close()
-            with self.lock:
-                self.inflight.discard(trade_key)
-                self.position_cache = (None, 0.0, None)
-                self.latest_cache = (0.0, None)
+                    self.status = f"TP maintenance error: {type(exc).__name__}"
+            finally:
+                if bot is not None:
+                    bot.close()
 
     def close(self):
         self.stop.set()
@@ -755,6 +716,7 @@ class PriceChart:
         self.btc_trend_ticks = deque()
         self.up_trend_ticks = deque()
         self.bid_pressure_samples = deque()
+        self.top_depth_levels = {"bid": None, "ask": None}
         self.up_bid_pressure = None
         self.pressure_crossing = None
         self.discovery = Discovery(self.feed)
@@ -877,6 +839,10 @@ class PriceChart:
         self.last_activity_render = now
         activity = self.feed.market_activity(depth_levels=12, trade_seconds=60)
         depth, trades = activity.get("depth", {}), activity.get("trades", [])
+        self.top_depth_levels = {
+            "bid": largest_depth_level(depth, "bids"),
+            "ask": largest_depth_level(depth, "asks"),
+        }
         totals = {}
         for outcome in ("Up", "Down"):
             book = depth.get(outcome, {})
@@ -971,13 +937,11 @@ class PriceChart:
             self.btc_trend_ticks.clear()
             self.up_trend_ticks.clear()
             self.bid_pressure_samples.clear()
+            self.top_depth_levels = {"bid": None, "ask": None}
             self.up_bid_pressure = None
             self.pressure_crossing = None
             self.coinbase_offset = None
         self._update_market_activity(now)
-        if market:
-            self.jump_trader.exit_on_pressure(
-                market[0], self.up_bid_pressure, quotes)
         if (btc is not None and coinbase_price is not None and
                 self.coinbase_offset is None):
             self.coinbase_offset = btc - coinbase_price
@@ -1028,7 +992,7 @@ class PriceChart:
                     self.jump_trader.status = (
                         f"{outcome.upper()} resting bid pressure crossed 80% "
                         f"to {pressure:.1%}; "
-                        "order submitted; software exit at 70% pressure")
+                        "order submitted with 10% PolySimulator TP")
         if btc is not None:
             self.btc_card[1].configure(text=f"${btc:,.2f}")
             if price_to_beat is not None:
@@ -1058,8 +1022,9 @@ class PriceChart:
                      if latest_trade.get("price") else "")
             shares = (f" | {float(latest_trade['shares']):.3f} shares"
                       if latest_trade.get("shares") else "")
-            target = (f" | EXIT {str(latest_trade.get('tp_state') or '').upper()}"
-                      if latest_trade.get("entry_state") == "filled" else "")
+            target = (f" | TP {latest_trade['target']:.4f} "
+                      f"{str(latest_trade.get('tp_state') or '').upper()}"
+                      if latest_trade.get("target") is not None else "")
             jump = (f" | BID PRESSURE {float(latest_trade['move']):.1f}%"
                     if latest_trade.get("move") is not None else "")
             state = str(latest_trade.get("entry_state") or "signal").upper()
@@ -1164,8 +1129,30 @@ class PriceChart:
             c.create_text(right - 5, beat_y - 5,
                           text=f"TO BEAT ${price_to_beat:,.2f}", fill="#ffffff",
                           anchor="se", font=("Consolas", 9, "bold"))
+        depth_lines = []
+        for side, color in (("bid", TOP_BID_COLOR), ("ask", TOP_ASK_COLOR)):
+            level = self.top_depth_levels.get(side)
+            if level is None:
+                continue
+            outcome, price, size, up_axis_price = level
+            level_y = bottom - up_axis_price * (bottom - top)
+            depth_lines.append([side, color, outcome, price, size, level_y])
+        if (len(depth_lines) == 2 and
+                abs(depth_lines[0][5] - depth_lines[1][5]) < 6):
+            midpoint = (depth_lines[0][5] + depth_lines[1][5]) / 2
+            depth_lines[0][5] = max(top, midpoint - 3)
+            depth_lines[1][5] = min(bottom, midpoint + 3)
+        for side, color, outcome, price, size, level_y in depth_lines:
+            c.create_line(left, level_y, right, level_y, fill=color,
+                          width=2, dash=(10, 5))
+            c.create_text(
+                right - 5, level_y - 4,
+                text=(f"TOP {side.upper()} {outcome.upper()} "
+                      f"{price:.3f} | {size:,.2f} shares"),
+                fill=color, anchor="se", font=("Consolas", 9, "bold"))
         if position:
             entry_y = bottom - position["entry"] * (bottom - top)
+            target_y = bottom - position["target"] * (bottom - top)
             c.create_line(left, entry_y, right, entry_y,
                           fill=POSITION_COLOR, width=2, dash=(8, 4))
             c.create_text(left + 6, entry_y - 5,
@@ -1174,11 +1161,14 @@ class PriceChart:
                                 f"{position['shares']:.2f} shares"),
                           fill=POSITION_COLOR, anchor="sw",
                           font=("Consolas", 9, "bold"))
-            c.create_text(right - 5, entry_y - 4,
-                          text=(f"SOFTWARE EXIT AT 70% BID PRESSURE "
-                                f"[{position['tp_state']}]") ,
-                          fill=POSITION_COLOR, anchor="se",
-                          font=("Consolas", 9))
+            if 0 <= position["target"] <= 1:
+                c.create_line(left, target_y, right, target_y,
+                              fill=POSITION_COLOR, width=1, dash=(2, 5))
+                c.create_text(right - 5, target_y - 4,
+                              text=(f"10% TP on UP axis {position['target']:.3f} "
+                                    f"[{position['tp_state']}]") ,
+                              fill=POSITION_COLOR, anchor="se",
+                              font=("Consolas", 9))
         if len(self.samples) < 2:
             return
         start = now - WINDOW_SECONDS
