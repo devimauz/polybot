@@ -49,6 +49,12 @@ MIN_ENTRY_PRICE = Decimal("0.30")
 MAX_ENTRY_PRICE = Decimal("0.70")
 STAKE = Decimal("1.10")
 TAKE_PROFIT = Decimal("0.05")
+# Stop-loss: exit the whole position when the bid falls this far below the
+# entry price. A resting limit SELL cannot act as a stop on the CLOB (a sell
+# limit at or below the current bid crosses the book and fills immediately),
+# so the stop is a software trigger: observe() force-sells at market the
+# moment bid <= stop, cancelling the resting TP first.
+STOP_LOSS = Decimal("0.05")
 # FAK buy limit = quoted ask + this band. Wider band = more aggressive fill
 # on thin/moving books; you only ever pay the actual best available ask.
 ENTRY_SLIPPAGE = Decimal("0.06")
@@ -865,6 +871,11 @@ class PolymarketJumpTrader:
             price = paid / shares
             target = (price * (Decimal("1") + TAKE_PROFIT) / tick).to_integral_value(
                 rounding=ROUND_CEILING) * tick
+            # Stop price: floor to tick so the trigger is bid < stop (the bid
+            # must drop below this level). Mirrors the TP (ceiling to tick)
+            # on the other side of the entry.
+            stop = (price * (Decimal("1") - STOP_LOSS) / tick).to_integral_value(
+                rounding=ROUND_FLOOR) * tick
             self._update(request_id, entry_state="filled", price=str(price),
                          shares=str(shares), tp_state="watching",
                          target=str(target), filled_at=time.time(),
@@ -873,6 +884,7 @@ class PolymarketJumpTrader:
             position = {
                 "id": request_id, "market": slug, "outcome": outcome, "token": token,
                 "tick": tick, "shares": shares, "entry": price, "target": target,
+                "stop": stop,
                 "selling": False, "sell_deadline": None,
                 # Hard exit clock: 0.5s after this fill, if the resting TP
                 # has not filled at target, the position is force-sold at the
@@ -956,6 +968,7 @@ class PolymarketJumpTrader:
         if not self.live:
             return
         now = time.monotonic()
+        stop_hit = False
         with self.lock:
             position = self.open_position
             if (not position or position["market"] != slug or
@@ -965,13 +978,24 @@ class PolymarketJumpTrader:
                             position.get("exit_mode", "software") == "resting")
             deadline = (position.get("tp_deadline") if resting_live
                         else position.get("deadline"))
+            quote = quotes.get(position["outcome"])
+            bid = Decimal(quote.bid) if quote is not None else None
+            stop = position.get("stop")
+            stop_hit = (bid is not None and stop is not None
+                        and bid <= stop)
             if deadline is not None and now >= deadline:
                 force = True
+            elif stop_hit:
+                # Stop-loss: the bid has dropped to entry minus STOP_LOSS.
+                # Exit at market NOW instead of waiting for the exit clock
+                # or the TP window (a resting limit can't stop a falling
+                # bid on the CLOB — a sell limit below the bid would just
+                # cross and fill, so the stop is this software trigger).
+                force = True
             elif resting_live:
-                return  # resting TP live and still inside its window
+                return  # resting TP live, inside its window, stop not hit
             else:
-                quote = quotes.get(position["outcome"])
-                if quote is None or Decimal(quote.bid) < position["target"]:
+                if bid is None or bid < position["target"]:
                     return
                 force = False
             if position.get("sell_deadline") is None:
@@ -982,8 +1006,6 @@ class PolymarketJumpTrader:
                 self._update(position["id"], tp_state="sell_timeout")
                 return
             position["selling"] = True
-            quote = quotes.get(position["outcome"])
-            bid = Decimal(quote["bid"]) if quote else None
             trade_id = position["id"]
         if force and position.get("exit_mode") == "resting":
             # Pull the resting maker TP so the forced market sell is the only
@@ -991,10 +1013,11 @@ class PolymarketJumpTrader:
             self._cancel_resting(trade_id)
         self._update(trade_id, tp_state="selling")
         with self.lock:
-            self.status = (f"{'forced ' if force else ''}software sell "
-                           f"triggered {position['outcome']}"
-                           + (f" bid {bid:.3f}" if bid is not None
-                              else " (no bid quote)"))
+            self.status = (
+                f"{'stop-loss ' if stop_hit else 'forced ' if force else ''}"
+                f"software sell triggered {position['outcome']}"
+                + (f" bid {bid:.3f}" if bid is not None
+                   else " (no bid quote)"))
         threading.Thread(target=self._sell,
                          args=(dict(position), bid),
                          name="chart-polymarket-sell", daemon=True).start()
