@@ -23,7 +23,7 @@ RTDS_API = "wss://ws-live-data.polymarket.com"
 COINBASE_API = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
-KRAKEN_API = "https://api.kraken.com/0/public/Ticker"
+KRAKEN_WS = "wss://ws.kraken.com/v2"
 BITSTAMP_API = "https://www.bitstamp.net/api/v2/ticker/btcusd/"
 OKX_API = "https://www.okx.com/api/v5/market/ticker"
 BYBIT_API = "https://api.bybit.com/v5/market/tickers"
@@ -33,11 +33,12 @@ GEMINI_API = "https://api.gemini.com/v1/pubticker/btcusd"
 WINDOW_SECONDS = 60.0
 TRADE_START_DELAY_SECONDS = 0.0
 TRADE_COOLDOWN_SECONDS = 5.0
-JUMP_STAKE = Decimal("100")
-TAKE_PROFIT_RATE = Decimal("0.10")
+JUMP_STAKE = Decimal("10")
+TAKE_PROFIT_RATE = Decimal("0.05")
+KRAKEN_MOVE_THRESHOLD = 5.0
 RESTING_BID_PRESSURE_THRESHOLD = 0.80
-MIN_ENTRY_PRICE = Decimal("0.30")
-MAX_ENTRY_PRICE = Decimal("0.70")
+MIN_ENTRY_PRICE = Decimal("0.20")
+MAX_ENTRY_PRICE = Decimal("0.80")
 MAX_ORDER_LIMIT = Decimal("0.99")
 TREND_SECONDS = 10.0
 TREND_MIN_MOVE = 1.0
@@ -57,8 +58,6 @@ COINBASE_COLOR, BINANCE_COLOR = "#4d8dff", "#f08a24"
 KRAKEN_COLOR, BITSTAMP_COLOR = "#a970ff", "#45d6d0"
 OKX_COLOR, BYBIT_COLOR, GEMINI_COLOR = "#eeeeee", "#f4d03f", "#e056fd"
 POSITION_COLOR = "#5bc0ff"
-TOP_BID_COLOR = "#35d0ba"
-TOP_ASK_COLOR = "#ff9f43"
 
 
 def jump_direction(samples, threshold):
@@ -99,21 +98,19 @@ def position_on_up_axis(outcome, price):
     return price if outcome == "Up" else 1.0 - price
 
 
-def largest_depth_level(depth, side):
-    """Return the largest-share (outcome, price, size, UP-axis price) level."""
-    best = None
-    for outcome in ("Up", "Down"):
-        for price, size in depth.get(outcome, {}).get(side, []):
-            candidate = (outcome, float(price), float(size),
-                         position_on_up_axis(outcome, price))
-            if best is None or candidate[2] > best[2]:
-                best = candidate
-    return best
-
-
 def crossed_above(previous, current, threshold):
     """Return true only for a fresh upward crossing of a threshold."""
     return previous is not None and previous <= threshold < current
+
+
+def kraken_move_signal(previous, current, threshold=KRAKEN_MOVE_THRESHOLD):
+    """Return an UP/DOWN signal for a single Kraken price move of $5 or more."""
+    if previous is None or current is None:
+        return None
+    move = current - previous
+    if abs(move) < threshold:
+        return None
+    return ("Up" if move > 0 else "Down"), move
 
 
 def resting_pressure_crossing(previous_up, current_up,
@@ -315,18 +312,17 @@ class PolymarketBTCFeed:
             self.stop.wait(0.5)
 
 
-class ExchangePriceFeed:
-    """Poll one public exchange ticker without blocking the chart UI."""
+class KrakenPriceFeed:
+    """Stream Kraken BTC/USD last trades over the public WebSocket v2 API."""
 
-    def __init__(self, name, url, params, parser, headers=None):
-        self.name, self.url, self.params, self.parser = name, url, params, parser
-        self.headers = headers or {}
+    def __init__(self):
         self.lock = threading.Lock()
         self.price = None
         self.last_changed = None
-        self.error = f"Connecting to {name}..."
+        self.error = "Connecting to Kraken WebSocket..."
         self.stop = threading.Event()
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread = threading.Thread(
+            target=self.run, name="kraken-btc-feed", daemon=True)
 
     def start(self):
         self.thread.start()
@@ -336,26 +332,49 @@ class ExchangePriceFeed:
             return self.price, self.error, self.last_changed
 
     def run(self):
-        headers = {"User-Agent": "btc-live-chart/1.0", **self.headers}
-        with httpx.Client(headers=headers,
-                          timeout=5) as client:
-            while not self.stop.is_set():
-                try:
-                    params = dict(self.params)
-                    params["_"] = int(time.time() * 1000)
-                    response = client.get(self.url, params=params)
-                    response.raise_for_status()
-                    price = float(self.parser(response.json()))
+        subscription = {
+            "method": "subscribe",
+            "params": {
+                "channel": "ticker", "symbol": ["BTC/USD"],
+                "event_trigger": "trades", "snapshot": True,
+            },
+        }
+        while not self.stop.is_set():
+            socket = None
+            try:
+                socket = websocket.create_connection(KRAKEN_WS, timeout=8)
+                socket.send(json.dumps(subscription))
+                socket.settimeout(3)
+                while not self.stop.is_set():
+                    try:
+                        message = json.loads(socket.recv())
+                    except websocket.WebSocketTimeoutException:
+                        socket.ping()
+                        continue
+                    if message.get("channel") != "ticker":
+                        if message.get("success") is False:
+                            raise RuntimeError(message.get("error", "subscription failed"))
+                        continue
+                    data = message.get("data") or []
+                    if not data or data[0].get("symbol") != "BTC/USD":
+                        continue
+                    price = float(data[0]["last"])
                     if price <= 0:
-                        raise ValueError("invalid price")
+                        continue
                     with self.lock:
                         if price != self.price:
                             self.last_changed = time.monotonic()
                         self.price, self.error = price, ""
-                except Exception as exc:
-                    with self.lock:
-                        self.error = f"{self.name} {type(exc).__name__}"
+            except Exception as exc:
+                with self.lock:
+                    self.error = f"Kraken WebSocket {type(exc).__name__}"
                 self.stop.wait(0.5)
+            finally:
+                if socket is not None:
+                    try:
+                        socket.close()
+                    except Exception:
+                        pass
 
 
 class CoinbasePriceFeed:
@@ -415,7 +434,7 @@ class CoinbasePriceFeed:
 
 
 class JumpPaperTrader:
-    """PolySimulator pressure entries with server-side 10% take-profits."""
+    """PolySimulator Kraken-move entries with server-side 5% take-profits."""
 
     venue_name = "POLYSIM"
 
@@ -443,7 +462,7 @@ class JumpPaperTrader:
         self.inflight = set()
         self.preparing = set()
         self.prepared = {}
-        self.status = "waiting for 80% entry pressure; PolySimulator TP is 10%"
+        self.status = "waiting for a +/-$5 Kraken move; PolySimulator TP is 5%"
         self.position_cache = (None, 0.0, None)
         self.latest_cache = (0.0, None)
         self.stop = threading.Event()
@@ -732,7 +751,7 @@ class Discovery:
 
 
 class PriceChart:
-    def __init__(self, root, trader_factory=DisplayOnlyTrader):
+    def __init__(self, root, trader_factory=JumpPaperTrader):
         self.root = root
         root.title("BTC + Polymarket Confirmation Trend - PolySimulator")
         root.geometry("1450x820")
@@ -740,15 +759,17 @@ class PriceChart:
         root.configure(bg=BG)
         self.feed, self.btc_feed = MarketFeed(), PolymarketBTCFeed()
         self.coinbase_feed = CoinbasePriceFeed()
+        self.kraken_feed = KrakenPriceFeed()
         self.jump_trader = trader_factory()
         self.last_jump_price = None
         self.last_coinbase_move = None
+        self.last_kraken_price = None
+        self.last_kraken_move = None
         self.directional_moves = deque(maxlen=3)
         self.trend_signal_zone = None
         self.btc_trend_ticks = deque()
         self.up_trend_ticks = deque()
         self.bid_pressure_samples = deque()
-        self.top_depth_levels = {"bid": None, "ask": None}
         self.up_bid_pressure = None
         self.pressure_crossing = None
         self.discovery = Discovery(self.feed)
@@ -769,10 +790,11 @@ class PriceChart:
         self.btc_card = self.card(cards, "POLYMARKET BTC-USD", BTC_COLOR)
         self.coinbase_card = self.card(
             cards, "COINBASE EXCHANGE BTC-USD", COINBASE_COLOR)
+        self.kraken_card = self.card(cards, "KRAKEN BTC/USD", KRAKEN_COLOR)
         self.up_card = self.card(cards, "POLYMARKET UP", UP_COLOR)
         self.down_card = self.card(cards, "POLYMARKET DOWN", DOWN_COLOR)
         all_cards = (self.btc_card, self.coinbase_card,
-                     self.up_card, self.down_card)
+                     self.kraken_card, self.up_card, self.down_card)
         for index, card in enumerate(all_cards):
             card[0].pack(side="left", fill="x", expand=True,
                          padx=(0 if index == 0 else 3,
@@ -795,6 +817,7 @@ class PriceChart:
         self.discovery.start()
         self.btc_feed.start()
         self.coinbase_feed.start()
+        self.kraken_feed.start()
         self.tick()
 
     def _build_market_activity_panel(self):
@@ -871,10 +894,6 @@ class PriceChart:
         self.last_activity_render = now
         activity = self.feed.market_activity(depth_levels=12, trade_seconds=60)
         depth, trades = activity.get("depth", {}), activity.get("trades", [])
-        self.top_depth_levels = {
-            "bid": largest_depth_level(depth, "bids"),
-            "ask": largest_depth_level(depth, "asks"),
-        }
         totals = {}
         for outcome in ("Up", "Down"):
             book = depth.get(outcome, {})
@@ -957,6 +976,7 @@ class PriceChart:
         market, poly_error = self.discovery.snapshot()
         btc, price_to_beat, btc_error = self.btc_feed.snapshot()
         coinbase_price, coinbase_error = self.coinbase_feed.snapshot()
+        kraken_price, kraken_error, kraken_changed = self.kraken_feed.snapshot()
         quotes, now = self.feed.quotes(), time.monotonic()
         if market and market[0] != self.current_slug:
             self.current_slug = market[0]
@@ -964,16 +984,25 @@ class PriceChart:
             self.samples.clear()
             self.last_jump_price = None
             self.last_coinbase_move = None
+            self.last_kraken_price = None
+            self.last_kraken_move = None
             self.directional_moves.clear()
             self.trend_signal_zone = None
             self.btc_trend_ticks.clear()
             self.up_trend_ticks.clear()
             self.bid_pressure_samples.clear()
-            self.top_depth_levels = {"bid": None, "ask": None}
             self.up_bid_pressure = None
             self.pressure_crossing = None
             self.coinbase_offset = None
         self._update_market_activity(now)
+        kraken_signal = None
+        if kraken_price is not None and kraken_price != self.last_kraken_price:
+            kraken_signal = kraken_move_signal(
+                self.last_kraken_price, kraken_price)
+            self.last_kraken_move = (
+                None if self.last_kraken_price is None
+                else kraken_price - self.last_kraken_price)
+            self.last_kraken_price = kraken_price
         if (btc is not None and coinbase_price is not None and
                 self.coinbase_offset is None):
             self.coinbase_offset = btc - coinbase_price
@@ -995,36 +1024,33 @@ class PriceChart:
             while (self.btc_trend_ticks and
                    self.btc_trend_ticks[0][0] < now - TREND_SECONDS):
                 self.btc_trend_ticks.popleft()
-        crossing = self.pressure_crossing
-        if crossing is not None:
-            self.pressure_crossing = None
-            outcome, pressure = crossing
+        if kraken_signal is not None:
+            outcome, move = kraken_signal
             quote = quotes.get(outcome)
             if not market:
                 with self.jump_trader.lock:
-                    self.jump_trader.status = "80% pressure crossing skipped: no market"
+                    self.jump_trader.status = "Kraken move skipped: no market"
             elif quote is None:
                 with self.jump_trader.lock:
                     self.jump_trader.status = (
-                        f"80% pressure crossing skipped: {outcome.upper()} ask unavailable")
+                        f"Kraken move skipped: {outcome.upper()} ask unavailable")
             elif quote.ask - quote.bid > MAX_ENTRY_SPREAD:
                 with self.jump_trader.lock:
                     self.jump_trader.status = (
-                        f"80% pressure crossing skipped: spread "
+                        f"Kraken move skipped: spread "
                         f"{quote.ask - quote.bid:.3f} > {MAX_ENTRY_SPREAD}")
             elif not MIN_ENTRY_PRICE <= quote.ask <= MAX_ENTRY_PRICE:
                 with self.jump_trader.lock:
                     self.jump_trader.status = (
-                        f"80% pressure crossing skipped: ask {quote.ask:.3f} outside "
+                        f"Kraken move skipped: ask {quote.ask:.3f} outside "
                         f"{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}")
             elif self.jump_trader.submit(
-                    market[0], outcome, pressure * 100.0, quote.tick,
+                    market[0], outcome, move, quote.tick,
                     token=market[2][outcome]):
                 with self.jump_trader.lock:
                     self.jump_trader.status = (
-                        f"{outcome.upper()} resting bid pressure crossed 80% "
-                        f"to {pressure:.1%}; "
-                        "order submitted with 10% PolySimulator TP")
+                        f"Kraken moved {move:+.2f} USD; {outcome.upper()} order "
+                        "submitted with 5% PolySimulator TP")
         if btc is not None:
             self.btc_card[1].configure(text=f"${btc:,.2f}")
             if price_to_beat is not None:
@@ -1046,6 +1072,17 @@ class PriceChart:
                 text=f"{move_text}   |   {offset_text}",
                 fg=(UP_COLOR if (self.last_coinbase_move or 0) > 0 else
                     DOWN_COLOR if (self.last_coinbase_move or 0) < 0 else MUTED))
+        if kraken_price is not None:
+            self.kraken_card[1].configure(
+                text=f"${kraken_price:,.2f}", fg=KRAKEN_COLOR)
+            age = (None if kraken_changed is None else
+                   max(0.0, now - kraken_changed))
+            move_text = ("waiting for next trade" if self.last_kraken_move is None
+                         else f"move {self.last_kraken_move:+.2f} USD")
+            self.kraken_card[2].configure(
+                text=(f"{move_text} | changed {age:.1f}s ago" if age is not None
+                      else move_text),
+                fg=MUTED)
         up, down = quotes.get("Up"), quotes.get("Down")
         position = self.jump_trader.position(market[0]) if market else None
         latest_trade = self.jump_trader.latest_trade()
@@ -1057,7 +1094,7 @@ class PriceChart:
             target = (f" | TP {latest_trade['target']:.4f} "
                       f"{str(latest_trade.get('tp_state') or '').upper()}"
                       if latest_trade.get("target") is not None else "")
-            jump = (f" | BID PRESSURE {float(latest_trade['move']):.1f}%"
+            jump = (f" | KRAKEN MOVE {float(latest_trade['move']):+.2f} USD"
                     if latest_trade.get("move") is not None else "")
             state = str(latest_trade.get("entry_state") or "signal").upper()
             self.trade_banner.configure(
@@ -1079,17 +1116,18 @@ class PriceChart:
                 f"{1.0 - position['entry']:.3f}")
             self.down_card[2].configure(
                 text=f"bid {down.bid:.3f}   ask {down.ask:.3f}{position_text}")
-        if btc is not None or coinbase_price is not None or up or down:
+        if (btc is not None or coinbase_price is not None or
+                kraken_price is not None or up or down):
             synced_coinbase = (
                 None if coinbase_price is None or self.coinbase_offset is None
                 else coinbase_price + self.coinbase_offset)
-            self.samples.append((now, synced_coinbase,
+            self.samples.append((now, synced_coinbase, kraken_price,
                                  None if up is None else float(up.probability),
                                  None if down is None else float(down.probability)))
             while self.samples and self.samples[0][0] < now - WINDOW_SECONDS:
                 self.samples.popleft()
         errors = " | ".join(filter(
-            None, (poly_error, btc_error, coinbase_error)))
+            None, (poly_error, btc_error, coinbase_error, kraken_error)))
         if market:
             remaining = max(0, int(market[1] - time.time()))
             trade_status = self.jump_trader.snapshot()
@@ -1112,6 +1150,7 @@ class PriceChart:
         width, height = max(1, c.winfo_width()), max(1, c.winfo_height())
         left, right, top, bottom = 82, width - 62, 42, height - 30
         values = [sample[1] for sample in self.samples if sample[1] is not None]
+        values.extend(sample[2] for sample in self.samples if sample[2] is not None)
         if price_to_beat is not None:
             values.append(price_to_beat)
         if values:
@@ -1131,15 +1170,17 @@ class PriceChart:
                           fill=MUTED, anchor="w")
         c.create_text(left, 18, text="Coinbase BTC-USD (synced)",
                       fill=COINBASE_COLOR, anchor="w")
-        c.create_text(left + 155, 18, text="Polymarket Up",
+        c.create_text(left + 155, 18, text="Kraken BTC/USD",
+                      fill=KRAKEN_COLOR, anchor="w")
+        c.create_text(left + 270, 18, text="Polymarket Up",
                       fill=UP_COLOR, anchor="w")
-        c.create_text(left + 270, 18, text="Polymarket Down",
+        c.create_text(left + 385, 18, text="Polymarket Down",
                       fill=DOWN_COLOR, anchor="w")
-        c.create_text(left + 410, 18, text="UP bid pressure",
+        c.create_text(left + 525, 18, text="UP bid pressure",
                       fill=BTC_COLOR, anchor="w")
         trend_points = [
             (stamp, coinbase_price)
-            for stamp, coinbase_price, _, _ in self.samples
+            for stamp, coinbase_price, _, _, _ in self.samples
             if coinbase_price is not None and stamp >= now - TREND_SECONDS]
         trend = price_trend(trend_points)
         if trend:
@@ -1147,7 +1188,7 @@ class PriceChart:
             trend_color = (UP_COLOR if direction == "UP" else
                            DOWN_COLOR if direction == "DOWN" else MUTED)
             arrow = "↑" if direction == "UP" else "↓" if direction == "DOWN" else "→"
-            c.create_text(left + 530, 18,
+            c.create_text(left + 645, 18,
                           text=f"{arrow} {direction} {move:+.2f} / {TREND_SECONDS:.0f}s",
                           fill=trend_color, anchor="w",
                           font=("Consolas", 10, "bold"))
@@ -1161,27 +1202,6 @@ class PriceChart:
             c.create_text(right - 5, beat_y - 5,
                           text=f"TO BEAT ${price_to_beat:,.2f}", fill="#ffffff",
                           anchor="se", font=("Consolas", 9, "bold"))
-        depth_lines = []
-        for side, color in (("bid", TOP_BID_COLOR), ("ask", TOP_ASK_COLOR)):
-            level = self.top_depth_levels.get(side)
-            if level is None:
-                continue
-            outcome, price, size, up_axis_price = level
-            level_y = bottom - up_axis_price * (bottom - top)
-            depth_lines.append([side, color, outcome, price, size, level_y])
-        if (len(depth_lines) == 2 and
-                abs(depth_lines[0][5] - depth_lines[1][5]) < 6):
-            midpoint = (depth_lines[0][5] + depth_lines[1][5]) / 2
-            depth_lines[0][5] = max(top, midpoint - 3)
-            depth_lines[1][5] = min(bottom, midpoint + 3)
-        for side, color, outcome, price, size, level_y in depth_lines:
-            c.create_line(left, level_y, right, level_y, fill=color,
-                          width=2, dash=(10, 5))
-            c.create_text(
-                right - 5, level_y - 4,
-                text=(f"TOP {side.upper()} {outcome.upper()} "
-                      f"{price:.3f} | {size:,.2f} shares"),
-                fill=color, anchor="se", font=("Consolas", 9, "bold"))
         if position:
             entry_y = bottom - position["entry"] * (bottom - top)
             target_y = bottom - position["target"] * (bottom - top)
@@ -1197,24 +1217,28 @@ class PriceChart:
                 c.create_line(left, target_y, right, target_y,
                               fill=POSITION_COLOR, width=1, dash=(2, 5))
                 c.create_text(right - 5, target_y - 4,
-                              text=(f"10% TP on UP axis {position['target']:.3f} "
+                              text=(f"5% TP on UP axis {position['target']:.3f} "
                                     f"[{position['tp_state']}]") ,
                               fill=POSITION_COLOR, anchor="se",
                               font=("Consolas", 9))
         if len(self.samples) < 2:
             return
         start = now - WINDOW_SECONDS
-        points = {"coinbase": [], "up": [], "down": []}
-        for stamp, coinbase_price, up, down in self.samples:
+        points = {"coinbase": [], "kraken": [], "up": [], "down": []}
+        for stamp, coinbase_price, kraken_price, up, down in self.samples:
             x = left + (stamp - start) / WINDOW_SECONDS * (right - left)
             if coinbase_price is not None:
                 points["coinbase"] += [
                     x, bottom - (coinbase_price-low)/(high-low)*(bottom-top)]
+            if kraken_price is not None:
+                points["kraken"] += [
+                    x, bottom - (kraken_price-low)/(high-low)*(bottom-top)]
             if up is not None:
                 points["up"] += [x, bottom - up * (bottom-top)]
             if down is not None:
                 points["down"] += [x, bottom - down * (bottom-top)]
         for name, color in (("coinbase", COINBASE_COLOR),
+                            ("kraken", KRAKEN_COLOR),
                             ("up", UP_COLOR), ("down", DOWN_COLOR)):
             if len(points[name]) >= 4:
                 c.create_line(*points[name], fill=color, width=2)
@@ -1229,6 +1253,7 @@ class PriceChart:
         self.discovery.stop.set()
         self.btc_feed.stop.set()
         self.coinbase_feed.stop.set()
+        self.kraken_feed.stop.set()
         self.jump_trader.close()
         self.feed.generation += 1
         self.root.destroy()

@@ -45,8 +45,8 @@ TRADE_COOLDOWN_SECONDS = 0.0
 MAX_TRADES_PER_WINDOW = 3
 JUMP_TP_RATE = Decimal("0.10")
 JUMP_NOISE_USD = 0.05
-MIN_ENTRY_PRICE = Decimal("0.30")
-MAX_ENTRY_PRICE = Decimal("0.70")
+MIN_ENTRY_PRICE = Decimal("0.50")
+MAX_ENTRY_PRICE = Decimal("0.50")
 STAKE = Decimal("1.10")
 TAKE_PROFIT = Decimal("0.05")
 # Stop-loss: exit the whole position when the bid falls this far below the
