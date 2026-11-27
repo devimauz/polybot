@@ -1,0 +1,14 @@
+[Unit]
+Description=Polymarket sub-second lag probe (Amsterdam)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/poly/pm_lag_probe.py
+WorkingDirectory=/root/poly
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

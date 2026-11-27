@@ -1,0 +1,12 @@
+sigma_1s median = 0.000059 (per-second log ret), windows measured=508
+T[60,285) EI=0.08 EO=0.01 | train n= 816 net= -357.82 t=-2.17 scalp=586 | test n= 606 net= -106.10 t=-0.75 scalp=388
+T[60,285) EI=0.08 EO=0.0 | train n= 814 net= -359.47 t=-2.18 scalp=566 | test n= 605 net= -105.83 t=-0.75 scalp=360
+T[60,285) EI=0.08 EO=0.02 | train n= 818 net= -359.28 t=-2.18 scalp=588 | test n= 607 net= -106.12 t=-0.75 scalp=389
+T[60,285) EI=0.06 EO=0.0 | train n= 818 net= -364.44 t=-2.21 scalp=569 | test n= 610 net= -106.77 t=-0.76 scalp=364
+T[60,285) EI=0.04 EO=0.0 | train n= 822 net= -364.64 t=-2.21 scalp=572 | test n= 611 net= -106.76 t=-0.76 scalp=364
+T[60,285) EI=0.06 EO=0.01 | train n= 820 net= -362.79 t=-2.20 scalp=589 | test n= 613 net= -111.72 t=-0.79 scalp=394
+T[60,285) EI=0.04 EO=0.01 | train n= 825 net= -363.03 t=-2.20 scalp=593 | test n= 614 net= -111.71 t=-0.79 scalp=394
+T[60,285) EI=0.06 EO=0.02 | train n= 823 net= -363.80 t=-2.21 scalp=592 | test n= 614 net= -111.96 t=-0.79 scalp=395
+T[60,285) EI=0.04 EO=0.02 | train n= 829 net= -363.94 t=-2.21 scalp=597 | test n= 615 net= -112.17 t=-0.80 scalp=395
+T[60,295) EI=0.08 EO=0.01 | train n= 828 net= -401.70 t=-2.45 scalp=601 | test n= 614 net= -135.38 t=-0.96 scalp=401
+family: 0 / 36 positive OOS

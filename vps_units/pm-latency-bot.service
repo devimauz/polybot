@@ -1,0 +1,14 @@
+[Unit]
+Description=Polymarket sub-second latency taker (live, Amsterdam)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/poly/pm_latency_bot.py --theta 8 --stake 5 --min-gap 30 --max-per-window 3 --chase-ticks 3 --live
+WorkingDirectory=/root/poly
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

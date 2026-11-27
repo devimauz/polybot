@@ -1,0 +1,20 @@
+sigma_1s median = 0.000059 (per-second log ret), windows measured=508
+T[30,295) EDGE=0.12 | train n=248 net= +144.78 t=+1.04 | test n=249 net=  +28.73 t=+0.21
+T[30,285) EDGE=0.12 | train n=248 net= +144.78 t=+1.04 | test n=249 net=  +28.73 t=+0.21
+T[30,295) EDGE=0.06 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,295) EDGE=0.04 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,295) EDGE=0.02 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,285) EDGE=0.06 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,285) EDGE=0.04 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,285) EDGE=0.02 | train n=248 net= +143.25 t=+1.03 | test n=250 net=  +14.32 t=+0.10
+T[30,295) EDGE=0.08 | train n=248 net= +143.25 t=+1.03 | test n=249 net=  +13.82 t=+0.10
+T[30,285) EDGE=0.08 | train n=248 net= +143.25 t=+1.03 | test n=249 net=  +13.82 t=+0.10
+T[60,295) EDGE=0.06 | train n=253 net= -241.73 t=-1.89 | test n=248 net=  +49.14 t=+0.38
+T[60,285) EDGE=0.06 | train n=253 net= -241.73 t=-1.89 | test n=248 net=  +49.14 t=+0.38
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\bot\pricelog_bot\model.py", line 123, in <module>
+    pos_test = sum(1 for r in res if r[6]["net"] > 0)
+  File "C:\Users\user\Desktop\bot\pricelog_bot\model.py", line 123, in <genexpr>
+    pos_test = sum(1 for r in res if r[6]["net"] > 0)
+                                     ~^^^
+IndexError: tuple index out of range

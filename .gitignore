@@ -7,3 +7,22 @@ price_logs/
 *.log
 *.log.*
 *.out
+
+# secrets & host files — NEVER commit
+.dub_auth
+.vps_auth
+.vps_id_ed25519
+.vps_id_ed25519.pub
+*.key
+# data & artifacts
+_pm_out/
+_pm_cache/
+*.png
+*.npz
+nul
+
+# heavy artifacts & SECRET backups
+pricelog_bot/snapshots.pkl
+backups/
+*.pkl
+*.tgz
